@@ -267,6 +267,45 @@ void resetPN5180() {
   consecutiveErrors = 0;
 }
 
+const char* detectCardType(uint8_t* uid) {
+  // UID analyse omdat activateTypeA() SAK niet correct teruggeeft
+  
+  // Check voor 7-byte UID (cascade tag 0x88 of specifieke patronen)
+  // DESFire/NTAG424 hebben vaak UID die begint met 0x04
+  // en eindigt met checksums in laatste bytes
+  
+  bool is7ByteUID = false;
+  
+  // Check of dit een 7-byte UID is (byte 6 en 7 zijn niet 0x00)
+  if (uid[6] != 0x00 || uid[5] != 0x00) {
+    is7ByteUID = true;
+  }
+  
+  Serial.print(F("  [DEBUG] UID[0]=0x"));
+  Serial.print(uid[0], HEX);
+  Serial.print(F(", 7-byte UID: "));
+  Serial.println(is7ByteUID ? "YES" : "NO");
+  
+  // Detectie op basis van UID patronen
+  if (uid[0] == 0x04 && is7ByteUID) {
+    // 7-byte UID beginnend met 0x04 = meestal DESFire of NTAG 424
+    return "DESFire/NTAG424 (SECURE)";
+  }
+  else if (uid[0] == 0x08 && !is7ByteUID) {
+    // UID beginnend met 0x08 = vaak secure documents
+    return "Secure document (Passport/ID/License)";
+  }
+  else if (!is7ByteUID) {
+    // 4-byte UID = meestal unsecure tags
+    if ((uid[0] & 0xF0) == 0x00) {
+      return "Mifare Classic (unsecure)";
+    }
+    return "NTAG/Ultralight (unsecure)";
+  }
+  
+  return "Unknown card type";
+}
+
 // ISO 14443 loop
 void loop() {
   unsigned long currentMillis = millis();
@@ -353,13 +392,19 @@ void loop() {
   lastSuccessfulRead = millis();
   
   if (!shown) {
-    Serial.print(F("Card serial successful, UID="));
+    Serial.print(F("UID: "));
     for (int i=0; i<8; i++) {
-      if (uid[i] < 0x10) Serial.print(F("0")); // Leading zero voor single digits
+      if (uid[i] < 0x10) Serial.print(F("0"));
       Serial.print(uid[i], HEX);
       if (i < 7) Serial.print(F(":"));
     }
     Serial.println();
+    
+    // Detecteer card type
+    const char* cardType = detectCardType(uid);
+    Serial.print(F("Card Type: "));
+    Serial.println(cardType);
+    
     shown = true;
   }
 
