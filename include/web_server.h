@@ -457,11 +457,7 @@ private:
     }
 };
 
-// Helper function implementation
-void webServerBroadcastLog(NFCWebServer* ws, const String& message, const String& level) {
-    if (ws != nullptr) {
-        ws->broadcastLog(message, level);
-    }
-}
+// Helper function declaration for ServerClient logging
+void webServerBroadcastLog(NFCWebServer* ws, const String& message, const String& level);
 
 #endif // WEB_SERVER_H
