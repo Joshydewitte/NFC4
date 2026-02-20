@@ -206,12 +206,16 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
     <div class="card" id="configModeCard" style="display: %CONFIG_DISPLAY%;">
         <h2>Config Modus Opties</h2>
         <div class="info-box">
-            <strong>🔑 Twee methoden voor kaart personalisatie:</strong><br>
-            <strong>1. Server Keys (Aanbevolen)</strong> - Haal keys automatisch op van server<br>
-            <strong>2. Handmatige Masterkey</strong> - Voor offline/test personalisatie
+            <strong>🔑 Kaart Personalisatie:</strong><br>
+            In config modus kun je nieuwe NTAG424 DNA kaarten personaliseren met de juiste master keys.<br>
+            De reader haalt automatisch de keys op van de server of gebruikt de handmatige masterkey.
         </div>
         
-        <div class="section-title" style="margin-top: 20px;">Handmatige Masterkey (Optioneel)</div>
+        <button onclick="location.href='/config-card'" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+            🔧 Start Kaart Personalisatie
+        </button>
+        
+        <div class="section-title" style="margin-top: 30px;">Handmatige Masterkey (Optioneel)</div>
         <div class="info-box" style="background: #fff8e1; border-left-color: #ffa500;">
             ⚠️ Alleen gebruiken voor offline personalisatie of testen.<br>
             Server keys worden automatisch gebruikt als geen masterkey is ingesteld.

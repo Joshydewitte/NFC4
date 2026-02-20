@@ -4,6 +4,8 @@
 #include "server_client.h"
 #include "wifi_manager.h"
 #include "nfc_reader.h"
+#include "ntag424_handler.h"
+#include "ntag424_crypto.h"
 
 // ============ PIN CONFIGURATION ============
 
@@ -47,6 +49,7 @@ SystemConfig systemConfig;
 ServerClient serverClient;
 NFCWebServer webServer;
 NFCReader* nfcReader = nullptr;
+NTAG424Handler* ntag424Handler = nullptr;
 
 // ============ BUTTON HANDLING ============
 
@@ -147,8 +150,19 @@ void setup() {
     Serial.flush();
     while(1) delay(1000);
   }
+    // Initialize NTAG424 Handler
+  Serial.println(F("\n=== NTAG424 Handler Initialization ==="));
+  PN5180ISO14443* nfcInstance = nfcReader->getNFC();
   
-  Serial.println(F("\n=================================="));
+  if (nfcInstance == nullptr) {
+    Serial.println(F("⚠️ Could not get PN5180 instance - NTAG424 functions disabled"));
+    webServer.broadcastLog("NTAG424 functies niet beschikbaar", "warning");
+  } else {
+    ntag424Handler = new NTAG424Handler(nfcInstance);
+    ntag424Handler->setWebServer(&webServer);
+    Serial.println(F("✅ NTAG424 Handler ready"));
+  }
+    Serial.println(F("\n=================================="));
   Serial.println(F("✅ System Ready!"));
   Serial.println(F("Hold D0 button for 3s to enter WiFi config"));
   Serial.println(F("==================================\n"));
@@ -265,74 +279,199 @@ void handleMachineMode(NFCReader::CardInfo& cardInfo) {
 // ============ CONFIG MODE HANDLER ============
 
 void handleConfigMode(NFCReader::CardInfo& cardInfo) {
-  Serial.println(F("\n=== CONFIG MODE ==="));
-  webServer.broadcastLog("Config modus - kaart configureren", "warning");
+  Serial.println(F("\n=== CONFIG MODE - NTAG424 PERSONALIZATION ==="));
+  webServer.broadcastLog("🔧 Config modus - Start NTAG424 personalisatie", "info");
   
-  String masterKey = "";
+  // Reset any previous ISO-DEP session
+  if (ntag424Handler != nullptr) {
+    ntag424Handler->resetSession();
+  }
+  
+  // Check if it's actually an NTAG424 DNA card
+  if (cardInfo.cardType.indexOf("NTAG424") < 0 && 
+      cardInfo.cardType.indexOf("DESFire") < 0 &&
+      cardInfo.cardType.indexOf("SECURE") < 0) {
+    webServer.broadcastLog("⚠️ Geen NTAG424 DNA kaart gedetecteerd", "warning");
+    webServer.broadcastLog("Card type: " + cardInfo.cardType, "info");
+    return;
+  }
+  
+  // Step 1: Obtain master key
+  String masterKeyHex = "";
   bool useManualKey = systemConfig.hasMasterkey();
   
   if (useManualKey) {
-    // Use manual masterkey (offline mode)
-    masterKey = systemConfig.getSessionMasterkey();
+    // Manual key (offline mode)
+    masterKeyHex = systemConfig.getSessionMasterkey();
     Serial.println(F("🔑 Using manual masterkey (offline)"));
-    webServer.broadcastLog("Gebruik handmatige masterkey voor personalisatie", "info");
-    
-    // TODO: Write card with manual masterkey via DESFire
-    webServer.broadcastLog("TODO: Kaart personaliseren met handmatige key", "warning");
-    webServer.broadcastLog("✅ Offline personalisatie voltooid", "success");
-    
+    webServer.broadcastLog("Gebruik handmatige masterkey", "warning");
   } else {
-    // Use server keys (normal flow)
-    Serial.println(F("🌐 Fetching keys from server..."));
-    webServer.broadcastLog("Haal keys op van server...", "info");
+    // Fetch from server
+    Serial.println(F("🌐 Fetching masterkey from server..."));
+    webServer.broadcastLog("Stap 1/4: Haal masterkey op van server...", "info");
     
-    // Check if card exists
-    String cardInfo_str = serverClient.getCardInfo(cardInfo.uidString);
+    masterKeyHex = serverClient.getCardKey(cardInfo.uidString, "master");
     
-    if (cardInfo_str.length() > 0) {
-      Serial.println(F("ℹ️ Card exists in database"));
-      webServer.broadcastLog("Kaart bestaat al - haal keys op...", "info");
+    if (masterKeyHex.length() != 32) {
+      // Card not in database - register first
+      Serial.println(F("📝 Card not registered - registering..."));
+      webServer.broadcastLog("Kaart niet bekend - registreren bij server...", "info");
       
-      // Fetch masterkey from server
-      masterKey = serverClient.getCardKey(cardInfo.uidString, "master");
+      bool registered = serverClient.registerCard(
+        cardInfo.uidString,
+        "Card_" + cardInfo.uidString.substring(0, 8),
+        "Auto-registered via config mode"
+      );
       
-      if (masterKey.length() > 0) {
-        webServer.broadcastLog("Master key ontvangen: " + masterKey.substring(0, 8) + "...", "success");
-        
-        // TODO: Write card with PN5180 and masterkey via DESFire commands
-        webServer.broadcastLog("TODO: Kaart personaliseren met DESFire commands", "warning");
-        webServer.broadcastLog("✅ Kaart klaar voor gebruik", "success");
-      } else {
-        webServer.broadcastLog("❌ Kon keys niet ophalen van server", "error");
+      if (!registered) {
+        Serial.println(F("❌ Registration failed"));
+        webServer.broadcastLog("❌ Kon kaart niet registreren bij server", "error");
+        return;
       }
       
-    } else {
-      // New card - register first
-      Serial.println(F("📝 New card - registering..."));
-      webServer.broadcastLog("Nieuwe kaart detecteerd - registreren...", "info");
+      webServer.broadcastLog("✅ Kaart geregistreerd", "success");
       
-      bool registered = serverClient.registerCard(cardInfo.uidString, 
-                                                   "Card_" + cardInfo.uidString.substring(0, 8), 
-                                                   "Auto-registered");
-      
-      if (registered) {
-        webServer.broadcastLog("✅ Kaart geregistreerd in database", "success");
-        
-        // Fetch keys
-        masterKey = serverClient.getCardKey(cardInfo.uidString, "master");
-        
-        if (masterKey.length() > 0) {
-          webServer.broadcastLog("Keys ontvangen: " + masterKey.substring(0, 8) + "...", "success");
-          
-          // TODO: Write card with PN5180
-          webServer.broadcastLog("TODO: Kaart personaliseren met DESFire", "warning");
-          webServer.broadcastLog("✅ Personalisatie voltooid", "success");
-        } else {
-          webServer.broadcastLog("❌ Keys ophalen mislukt", "error");
-        }
-      } else {
-        webServer.broadcastLog("❌ Kaart registratie mislukt", "error");
-      }
+      // Fetch key again
+      masterKeyHex = serverClient.getCardKey(cardInfo.uidString, "master");
     }
   }
+  
+  // Validate key
+  if (masterKeyHex.length() != 32) {
+    Serial.println(F("❌ Invalid masterkey received"));
+    webServer.broadcastLog("❌ Ongeldige masterkey ontvangen van server", "error");
+    return;
+  }
+  
+  Serial.print(F("✅ Master key: "));
+  Serial.print(masterKeyHex.substring(0, 8));
+  Serial.println("...");
+  webServer.broadcastLog("✅ Masterkey: " + masterKeyHex.substring(0, 8) + "...", "success");
+  
+  // Step 2: Convert hex string to bytes
+  uint8_t newKeyBytes[16];
+  size_t keyLen = NTAG424Crypto::hexStringToBytes(masterKeyHex, newKeyBytes, 16);
+  
+  if (keyLen != 16) {
+    Serial.println(F("❌ Key conversion failed"));
+    webServer.broadcastLog("❌ Key conversie mislukt", "error");
+    return;
+  }
+  
+  // Step 3: Ensure card is still present and activated
+  // NOTE: This is the LAST isCardPresent() check before entering ISO-DEP mode.
+  // After activateCard(), we must NOT call isCardPresent() again as it would
+  // reset the ISO-DEP session!
+  if (!nfcReader->isCardPresent()) {
+    Serial.println(F("❌ Card removed"));
+    webServer.broadcastLog("❌ Kaart verwijderd", "error");
+    return;
+  }
+  
+  // Step 4: Authenticate and change key
+  Serial.println(F("🔐 Authenticating with factory key..."));
+  webServer.broadcastLog("Stap 2/4: Authenticeer met factory key...", "info");
+  
+  // Check if handler is initialized
+  if (ntag424Handler == nullptr) {
+    Serial.println(F("❌ NTAG424 handler not initialized"));
+    webServer.broadcastLog("❌ NTAG424 handler niet geïnitialiseerd", "error");
+    return;
+  }
+  
+  // Test basic communication with GetVersion
+  Serial.println(F("🔍 Testing card communication..."));
+  
+  // First activate ISO14443-4 protocol
+  if (!ntag424Handler->activateCard()) {
+    Serial.println(F("❌ Failed to activate card for ISO-DEP communication"));
+    webServer.broadcastLog("❌ Kaart activatie mislukt - geen ISO-DEP support?", "error");
+    return;
+  }
+  
+  Serial.println(F("✅ Card activated for ISO-DEP"));
+  webServer.broadcastLog("✅ ISO-DEP activatie succesvol", "success");
+  
+  // Now try GetVersion
+  uint8_t versionInfo[28];
+  if (!ntag424Handler->getVersion(versionInfo)) {
+    Serial.println(F("❌ Failed to communicate with card - not a valid NTAG424 DNA?"));
+    webServer.broadcastLog("❌ Geen communicatie met kaart - geen geldige NTAG424 DNA?", "error");
+    webServer.broadcastLog("Tip: Controleer of het echt een NTAG424 DNA kaart is", "warning");
+    return;
+  }
+  
+  Serial.println(F("✅ Card communication OK"));
+  webServer.broadcastLog("✅ Kaart communicatie OK", "success");
+  
+  // First authenticate to verify card communication
+  NTAG424Handler::AuthResult authResult;
+  bool authenticated = ntag424Handler->authenticateEV2First(
+    0, 
+    NTAG424Handler::DEFAULT_AES_KEY, 
+    authResult
+  );
+  
+  if (!authenticated) {
+    Serial.print(F("❌ Authentication failed: "));
+    Serial.println(authResult.errorMessage);
+    webServer.broadcastLog("❌ Authenticatie mislukt: " + authResult.errorMessage, "error");
+    return;
+  }
+  
+  Serial.println(F("✅ Authentication successful"));
+  webServer.broadcastLog("✅ Authenticatie succesvol", "success");
+  
+  // Now change the key
+  Serial.println(F("✍️ Writing new master key to card..."));
+  webServer.broadcastLog("Stap 3/4: Schrijf nieuwe masterkey...", "info");
+  
+  bool keyChanged = ntag424Handler->changeKey(
+    0,  // Key number 0 (master key)
+    NTAG424Handler::DEFAULT_AES_KEY,  // Old key
+    newKeyBytes  // New key
+  );
+  
+  if (!keyChanged) {
+    Serial.println(F("❌ ChangeKey failed"));
+    webServer.broadcastLog("❌ Schrijven masterkey mislukt", "error");
+    return;
+  }
+  
+  Serial.println(F("✅ Master key written successfully"));
+  webServer.broadcastLog("✅ Masterkey geschreven!", "success");
+  
+  // Step 4: Verify by authenticating with new key
+  Serial.println(F("🔍 Verifying new key..."));
+  webServer.broadcastLog("Stap 4/4: Verificatie nieuwe key...", "info");
+  
+  NTAG424Handler::AuthResult verifyResult;
+  bool verified = ntag424Handler->authenticateEV2First(
+    0,
+    newKeyBytes,
+    verifyResult
+  );
+  
+  if (verified) {
+    Serial.println(F("✅✅✅ CARD PERSONALIZATION COMPLETE! ✅✅✅"));
+    webServer.broadcastLog("✅ Verificatie succesvol!", "success");
+    webServer.broadcastLog("🎉 Kaart gepersonaliseerd en gereed voor gebruik!", "success");
+    
+    // Log to server if connected
+    systemConfig.incrementCardsRead();
+  } else {
+    Serial.print(F("⚠️ Verification failed: "));
+    Serial.println(verifyResult.errorMessage);
+    webServer.broadcastLog("⚠️ Verificatie mislukt - key mogelijk niet correct!", "warning");
+    webServer.broadcastLog("Error: " + verifyResult.errorMessage, "warning");
+  }
+  
+  // Reset ISO-DEP session for next card
+  if (ntag424Handler != nullptr) {
+    ntag424Handler->resetSession();
+  }
+  
+  // Wait for card removal
+  Serial.println(F("\n👉 Remove card and present next card to personalize"));
+  webServer.broadcastLog("Verwijder kaart - klaar voor volgende kaart", "info");
 }

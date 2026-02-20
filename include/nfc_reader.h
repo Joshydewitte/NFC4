@@ -55,6 +55,9 @@ public:
     // Stats
     unsigned long getLastSuccessfulRead() const { return lastSuccessfulRead; }
     
+    // Get PN5180 instance for advanced NTAG424 operations
+    PN5180ISO14443* getNFC() { return nfc; }
+    
 private:
     // PN5180 instance
     PN5180ISO14443* nfc;

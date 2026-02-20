@@ -16,6 +16,7 @@ void webServerBroadcastLog(class NFCWebServer* ws, const String& message, const 
 #include "admin_setup_page.h"
 #include "settings_page.h"
 #include "status_page.h"
+#include "config_card_page.h"
 
 class NFCWebServer {
 private:
@@ -201,6 +202,24 @@ private:
         httpServer.on("/api/stats", HTTP_GET, [this]() {
             if (!requireAuth()) return;
             handleStatsAPI();
+        });
+        
+        // Config card personalization page
+        httpServer.on("/config-card", HTTP_GET, [this]() {
+            if (!requireAuth()) return;
+            httpServer.send(200, "text/html", CONFIG_CARD_PAGE);
+        });
+        
+        // Get current card API
+        httpServer.on("/api/card/current", HTTP_GET, [this]() {
+            if (!requireAuth()) return;
+            handleGetCurrentCard();
+        });
+        
+        // Start personalization API  
+        httpServer.on("/api/personalize/start", HTTP_POST, [this]() {
+            if (!requireAuth()) return;
+            handleStartPersonalization();
         });
     }
     
@@ -408,6 +427,25 @@ private:
         json += "\"uptime\":" + String(config->getUptime());
         json += "}";
         
+        httpServer.send(200, "application/json", json);
+    }
+    
+    void handleGetCurrentCard() {
+        // This will be implemented to return current detected card info
+        // For now, return empty
+        String json = "{\"present\":false}";
+        httpServer.send(200, "application/json", json);
+    }
+    
+    void handleStartPersonalization() {
+        String body = httpServer.arg("plain");
+        int uidStart = body.indexOf("\"uid\":\"") + 7;
+        int uidEnd = body.indexOf("\"", uidStart);
+        String uid = body.substring(uidStart, uidEnd);
+        
+        // Trigger personalization workflow
+        // This will be implemented in the next step
+        String json = "{\"success\":true,\"message\":\"Personalization started\"}";
         httpServer.send(200, "application/json", json);
     }
     
