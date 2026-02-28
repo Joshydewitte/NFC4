@@ -17,6 +17,7 @@ void webServerBroadcastLog(class NFCWebServer* ws, const String& message, const 
 #include "settings_page.h"
 #include "status_page.h"
 #include "config_card_page.h"
+#include "write_cards_page.h"
 
 class NFCWebServer {
 private:
@@ -80,6 +81,11 @@ public:
         json += "\"cardsRead\":" + String(cardsRead) + ",";
         json += "\"uptime\":" + String(uptime);
         json += "}}";
+        wsServer.broadcastTXT(json);
+    }
+    
+    void broadcastWriteCardStatus(const String& uid, const String& status, const String& message) {
+        String json = "{\"type\":\"write_card_status\",\"uid\":\"" + uid + "\",\"status\":\"" + status + "\",\"message\":\"" + message + "\"}";
         wsServer.broadcastTXT(json);
     }
     
@@ -220,6 +226,24 @@ private:
         httpServer.on("/api/personalize/start", HTTP_POST, [this]() {
             if (!requireAuth()) return;
             handleStartPersonalization();
+        });
+        
+        // Write cards page
+        httpServer.on("/write-cards", HTTP_GET, [this]() {
+            if (!requireAuth()) return;
+            httpServer.send(200, "text/html", WRITE_CARDS_PAGE);
+        });
+        
+        // Write cards API - Start
+        httpServer.on("/api/write/start", HTTP_POST, [this]() {
+            if (!requireAuth()) return;
+            handleWriteStart();
+        });
+        
+        // Write cards API - Stop
+        httpServer.on("/api/write/stop", HTTP_POST, [this]() {
+            if (!requireAuth()) return;
+            handleWriteStop();
         });
     }
     
@@ -447,6 +471,77 @@ private:
         // This will be implemented in the next step
         String json = "{\"success\":true,\"message\":\"Personalization started\"}";
         httpServer.send(200, "application/json", json);
+    }
+    
+    void handleWriteStart() {
+        String body = httpServer.arg("plain");
+        
+        // Parse JSON manually (simple approach)
+        int secretStart = body.indexOf("\"masterSecret\":\"") + 16;
+        int secretEnd = body.indexOf("\"", secretStart);
+        String masterSecret = body.substring(secretStart, secretEnd);
+        
+        int modeStart = body.indexOf("\"mode\":\"") + 8;
+        int modeEnd = body.indexOf("\"", modeStart);
+        String mode = body.substring(modeStart, modeEnd);
+        
+        // Parse isFactory (boolean)
+        bool isFactory = body.indexOf("\"isFactory\":true") > 0;
+        
+        // Parse previousKey if not factory
+        String previousKey = "";
+        if (!isFactory) {
+            int prevKeyStart = body.indexOf("\"previousKey\":\"") + 16;
+            if (prevKeyStart > 15) {  // Found
+                int prevKeyEnd = body.indexOf("\"", prevKeyStart);
+                previousKey = body.substring(prevKeyStart, prevKeyEnd);
+            }
+        }
+        
+        // Validate
+        if (masterSecret.length() < 16) {
+            String json = "{\"success\":false,\"message\":\"Master secret te kort (min 16 karakters)\"}";
+            httpServer.send(400, "application/json", json);
+            return;
+        }
+        
+        if (mode != "single" && mode != "continuous") {
+            String json = "{\"success\":false,\"message\":\"Ongeldige mode (moet single of continuous zijn)\"}";
+            httpServer.send(400, "application/json", json);
+            return;
+        }
+        
+        if (!isFactory && previousKey.length() != 32) {
+            String json = "{\"success\":false,\"message\":\"Vorige key moet 32 hex karakters zijn\"}";
+            httpServer.send(400, "application/json", json);
+            return;
+        }
+        
+        // Store settings (runtime only, NOT persistent)
+        config->setMasterSecret(masterSecret);
+        config->setIsFactory(isFactory);
+        if (!isFactory) {
+            config->setPreviousKey(previousKey);
+        }
+        config->setWriteMode(mode);
+        config->setWriteActive(true);
+        
+        String json = "{\"success\":true,\"message\":\"Schrijfproces gestart in " + mode + " modus\"}";
+        httpServer.send(200, "application/json", json);
+        
+        String cardType = isFactory ? "factory" : "gepersonaliseerd";
+        broadcastLog("🚀 Schrijfproces gestart (modus: " + mode + ", type: " + cardType + ")", "success");
+    }
+    
+    void handleWriteStop() {
+        config->setWriteActive(false);
+        config->clearMasterSecret();
+        config->clearPreviousKey();
+        
+        String json = "{\"success\":true,\"message\":\"Schrijfproces gestopt\"}";
+        httpServer.send(200, "application/json", json);
+        
+        broadcastLog("⏹️ Schrijfproces gestopt", "info");
     }
     
     void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {

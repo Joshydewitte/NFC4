@@ -4,7 +4,12 @@ SystemConfig::SystemConfig()
     : sessionMasterkey(""),
       masterkeyActive(false),
       startTime(0),
-      cardsRead(0) {
+      cardsRead(0),
+      writeModeMasterSecret(""),
+      writeModePreviousKey(""),
+      writeMode("single"),
+      writeActive(false),
+      writeIsFactory(true) {
     startTime = millis();
 }
 
@@ -192,6 +197,74 @@ uint32_t SystemConfig::getCardsRead() {
 
 unsigned long SystemConfig::getUptime() {
     return (millis() - startTime) / 1000;
+}
+
+// ============ WRITE MODE (SESSION ONLY) ============
+
+void SystemConfig::setMasterSecret(const String& secret) {
+    writeModeMasterSecret = secret;
+    Serial.println(F("✅ Master secret opgeslagen in RAM (niet persistent)"));
+}
+
+String SystemConfig::getMasterSecret() {
+    return writeModeMasterSecret;
+}
+
+void SystemConfig::clearMasterSecret() {
+    writeModeMasterSecret = "";
+    Serial.println(F("Master secret gewist uit RAM"));
+}
+
+void SystemConfig::setPreviousKey(const String& key) {
+    writeModePreviousKey = key;
+    Serial.println(F("✅ Previous key opgeslagen in RAM (niet persistent)"));
+}
+
+String SystemConfig::getPreviousKey() {
+    return writeModePreviousKey;
+}
+
+void SystemConfig::clearPreviousKey() {
+    writeModePreviousKey = "";
+    Serial.println(F("Previous key gewist uit RAM"));
+}
+
+void SystemConfig::setIsFactory(bool factory) {
+    writeIsFactory = factory;
+    Serial.print(F("Factory kaart: "));
+    Serial.println(factory ? "ja" : "nee");
+}
+
+bool SystemConfig::getIsFactory() {
+    return writeIsFactory;
+}
+
+void SystemConfig::setWriteMode(const String& mode) {
+    writeMode = mode;
+    Serial.print(F("Write mode: "));
+    Serial.println(mode);
+}
+
+String SystemConfig::getWriteMode() {
+    return writeMode;
+}
+
+void SystemConfig::setWriteActive(bool active) {
+    writeActive = active;
+    Serial.print(F("Write active: "));
+    Serial.println(active ? "YES" : "NO");
+}
+
+bool SystemConfig::isWriteActive() {
+    return writeActive;
+}
+
+bool SystemConfig::isSingleWriteMode() {
+    return writeMode == "single";
+}
+
+bool SystemConfig::isContinuousWriteMode() {
+    return writeMode == "continuous";
 }
 
 // ============ RESET FUNCTIONS ============

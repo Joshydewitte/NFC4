@@ -82,44 +82,65 @@ void NTAG424Crypto::rotateRight(const uint8_t* input, uint8_t* output, size_t le
     output[0] = last;
 }
 
-// Calculate CMAC using AES-128
+// Calculate CMAC using AES-128 according to NIST SP 800-38B
 bool NTAG424Crypto::calculateCMAC(const uint8_t* key, const uint8_t* data,
                                   size_t dataLen, uint8_t* mac) {
-    // Simplified CMAC implementation using basic AES-128
-    // This is a simplified version - for production, use full CMAC-AES
+    // CMAC-AES-128 implementation per NIST SP 800-38B
+    // https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-38B.pdf
     
-    // For NTAG424, we use CMAC-AES-128
-    // The full CMAC algorithm requires subkey generation, but we'll use a simplified approach
-    
-    // Initialize with zeros
-    uint8_t state[16] = {0};
+    const uint8_t Rb = 0x87;  // Constant for AES-128
     uint8_t zeroIV[16] = {0};
     
-    // Process complete 16-byte blocks
-    size_t numBlocks = (dataLen + 15) / 16;
-    
-    for (size_t i = 0; i < numBlocks; i++) {
-        uint8_t block[16] = {0};
-        size_t blockLen = 16;
-        
-        if (i == numBlocks - 1) {
-            // Last block may be partial
-            blockLen = dataLen - (i * 16);
-            if (blockLen > 0) {
-                memcpy(block, data + (i * 16), blockLen);
-            }
-            // Padding for last block (ISO 9797-1 Method 2)
-            if (blockLen < 16) {
-                block[blockLen] = 0x80;
-                for (size_t j = blockLen + 1; j < 16; j++) {
-                    block[j] = 0x00;
-                }
-            }
-        } else {
-            memcpy(block, data + (i * 16), 16);
+    // Helper lambda: Left shift array by 1 bit (big-endian byte order)
+    // In big-endian: byte[0] is MSB, byte[15] is LSB
+    // Left shift: carry flows from MSB to LSB (index 0 -> 15)
+    auto leftShift = [](const uint8_t* input, uint8_t* output) {
+        uint8_t carry = 0;
+        for (int i = 0; i < 16; i++) {  // Loop from MSB (0) to LSB (15)
+            uint8_t newCarry = (input[i] & 0x80) >> 7;  // Extract MSB
+            output[i] = (input[i] << 1) | carry;         // Shift and OR with previous carry
+            carry = newCarry;                             // Update carry for next byte
         }
+    };
+    
+    // Step 1: Generate subkeys K1 and K2
+    // L = AES-128(K, 0^128)
+    uint8_t L[16] = {0};
+    uint8_t zeroBlock[16] = {0};
+    if (!aesEncrypt(key, zeroIV, zeroBlock, 16, L)) {
+        return false;
+    }
+    
+    // K1 = L << 1
+    uint8_t K1[16];
+    leftShift(L, K1);
+    if (L[0] & 0x80) {  // If MSB(L) = 1
+        K1[15] ^= Rb;
+    }
+    
+    // K2 = K1 << 1
+    uint8_t K2[16];
+    leftShift(K1, K2);
+    if (K1[0] & 0x80) {  // If MSB(K1) = 1
+        K2[15] ^= Rb;
+    }
+    
+    // Step 2: Determine number of blocks
+    size_t n = (dataLen + 15) / 16;  // Round up
+    if (n == 0) {
+        n = 1;  // At least one block
+    }
+    
+    bool completeBlock = (dataLen > 0) && (dataLen % 16 == 0);
+    
+    // Step 3: Process all blocks except the last
+    uint8_t state[16] = {0};
+    
+    for (size_t i = 0; i < n - 1; i++) {
+        uint8_t block[16];
+        memcpy(block, data + (i * 16), 16);
         
-        // XOR with state
+        // XOR with state (CBC mode)
         for (int j = 0; j < 16; j++) {
             block[j] ^= state[j];
         }
@@ -130,8 +151,147 @@ bool NTAG424Crypto::calculateCMAC(const uint8_t* key, const uint8_t* data,
         }
     }
     
-    // Return first 8 bytes for NTAG424
-    memcpy(mac, state, 8);
+    // Step 4: Process last block with subkey
+    uint8_t lastBlock[16] = {0};
+    size_t lastBlockLen = dataLen - ((n - 1) * 16);
+    
+    if (completeBlock) {
+        // Complete last block: M_last = M_n XOR K1
+        memcpy(lastBlock, data + ((n - 1) * 16), 16);
+        for (int j = 0; j < 16; j++) {
+            lastBlock[j] ^= K1[j];
+        }
+    } else {
+        // Incomplete last block: M_last = (M_n || 10...0) XOR K2
+        if (lastBlockLen > 0) {
+            memcpy(lastBlock, data + ((n - 1) * 16), lastBlockLen);
+        }
+        lastBlock[lastBlockLen] = 0x80;  // Padding
+        for (size_t j = lastBlockLen + 1; j < 16; j++) {
+            lastBlock[j] = 0x00;
+        }
+        for (int j = 0; j < 16; j++) {
+            lastBlock[j] ^= K2[j];
+        }
+    }
+    
+    // XOR with state (CBC mode)
+    for (int j = 0; j < 16; j++) {
+        lastBlock[j] ^= state[j];
+    }
+    
+    // Final encryption
+    uint8_t T[16];
+    if (!aesEncrypt(key, zeroIV, lastBlock, 16, T)) {
+        return false;
+    }
+    
+    // Truncate MAC according to NTAG424 specification (NIST SP 800-38B):
+    // "Even-numbered bytes" means positions 2, 4, 6, 8, 10, 12, 14, 16
+    // Which corresponds to array indices 1, 3, 5, 7, 9, 11, 13, 15 (odd indices)
+    // Retained in order (NOT reversed)
+    mac[0] = T[1];
+    mac[1] = T[3];
+    mac[2] = T[5];
+    mac[3] = T[7];
+    mac[4] = T[9];
+    mac[5] = T[11];
+    mac[6] = T[13];
+    mac[7] = T[15];
+    
+    return true;
+}
+
+// Calculate full 16-byte CMAC (not truncated) for session key derivation
+bool NTAG424Crypto::calculateCMACFull(const uint8_t* key, const uint8_t* data,
+                                      size_t dataLen, uint8_t* mac) {
+    // Same algorithm as calculateCMAC but returns full 16-byte result
+    const uint8_t Rb = 0x87;
+    uint8_t zeroIV[16] = {0};
+    
+    auto leftShift = [](const uint8_t* input, uint8_t* output) {
+        uint8_t carry = 0;
+        for (int i = 0; i < 16; i++) {
+            uint8_t newCarry = (input[i] & 0x80) >> 7;
+            output[i] = (input[i] << 1) | carry;
+            carry = newCarry;
+        }
+    };
+    
+    // Generate subkeys K1 and K2
+    uint8_t L[16] = {0};
+    uint8_t zeroBlock[16] = {0};
+    if (!aesEncrypt(key, zeroIV, zeroBlock, 16, L)) {
+        return false;
+    }
+    
+    uint8_t K1[16];
+    leftShift(L, K1);
+    if (L[0] & 0x80) {
+        K1[15] ^= Rb;
+    }
+    
+    uint8_t K2[16];
+    leftShift(K1, K2);
+    if (K1[0] & 0x80) {
+        K2[15] ^= Rb;
+    }
+    
+    // Determine number of blocks
+    size_t n = (dataLen + 15) / 16;
+    if (n == 0) {
+        n = 1;
+    }
+    
+    bool completeBlock = (dataLen > 0) && (dataLen % 16 == 0);
+    
+    // Process all blocks except the last
+    uint8_t state[16] = {0};
+    
+    for (size_t i = 0; i < n - 1; i++) {
+        uint8_t block[16];
+        memcpy(block, data + (i * 16), 16);
+        
+        for (int j = 0; j < 16; j++) {
+            block[j] ^= state[j];
+        }
+        
+        if (!aesEncrypt(key, zeroIV, block, 16, state)) {
+            return false;
+        }
+    }
+    
+    // Process last block with subkey
+    uint8_t lastBlock[16] = {0};
+    size_t lastBlockLen = dataLen - ((n - 1) * 16);
+    
+    if (completeBlock) {
+        memcpy(lastBlock, data + ((n - 1) * 16), 16);
+        for (int j = 0; j < 16; j++) {
+            lastBlock[j] ^= K1[j];
+        }
+    } else {
+        if (lastBlockLen > 0) {
+            memcpy(lastBlock, data + ((n - 1) * 16), lastBlockLen);
+        }
+        lastBlock[lastBlockLen] = 0x80;
+        for (size_t j = lastBlockLen + 1; j < 16; j++) {
+            lastBlock[j] = 0x00;
+        }
+        for (int j = 0; j < 16; j++) {
+            lastBlock[j] ^= K2[j];
+        }
+    }
+    
+    for (int j = 0; j < 16; j++) {
+        lastBlock[j] ^= state[j];
+    }
+    
+    // Final encryption - return full 16 bytes
+    if (!aesEncrypt(key, zeroIV, lastBlock, 16, mac)) {
+        return false;
+    }
+    
     return true;
 }
 
@@ -180,36 +340,58 @@ String NTAG424Crypto::bytesToHexString(const uint8_t* bytes, size_t length) {
 }
 
 // Derive session keys (EV2)
+// According to NTAG424 DNA datasheet Section 9.1.7 (NIST SP 800-108 KDF)
 bool NTAG424Crypto::deriveSessionKeys(const uint8_t* rndA, const uint8_t* rndB,
                                      const uint8_t* key, uint8_t* encKey,
                                      uint8_t* macKey) {
-    // Session Vector (SV) = RndA[0..1] || RndB[0..1]
-    uint8_t sv[4];
-    sv[0] = rndA[0];
-    sv[1] = rndA[1];
-    sv[2] = rndB[0];
-    sv[3] = rndB[1];
+    // Session Vector construction (32 bytes):
+    // SV = Label || Counter || Length || Context
+    // Where Context = RndA[15..14] || (RndA[13..8] XOR RndB[15..10]) || RndB[9..0] || RndA[7..0]
     
-    // Derive ENC session key
-    // Input: 0x01 || SV || 0x00...0x00 (total 16 bytes)
-    uint8_t encInput[16];
-    encInput[0] = 0x01;
-    memcpy(encInput + 1, sv, 4);
-    memset(encInput + 5, 0x00, 11);
+    // Build SV1 for Encryption Key
+    // Label = 0xA5 0x5A, Counter = 0x00 0x01, Length = 0x00 0x80
+    uint8_t sv1[32];
+    sv1[0] = 0xA5;
+    sv1[1] = 0x5A;
+    sv1[2] = 0x00;  // Counter
+    sv1[3] = 0x01;
+    sv1[4] = 0x00;  // Length (128 bits)
+    sv1[5] = 0x80;
     
-    uint8_t zeroIV[16] = {0};
-    if (!aesEncrypt(key, zeroIV, encInput, 16, encKey)) {
+    // Context (26 bytes):
+    // RndA[15..14]
+    sv1[6] = rndA[15];
+    sv1[7] = rndA[14];
+    
+    // RndA[13..8] XOR RndB[15..10] (6 bytes)
+    for (int i = 0; i < 6; i++) {
+        sv1[8 + i] = rndA[13 - i] ^ rndB[15 - i];
+    }
+    
+    // RndB[9..0] (10 bytes)
+    for (int i = 0; i < 10; i++) {
+        sv1[14 + i] = rndB[9 - i];
+    }
+    
+    // RndA[7..0] (8 bytes)
+    for (int i = 0; i < 8; i++) {
+        sv1[24 + i] = rndA[7 - i];
+    }
+    
+    // Derive ENC key using CMAC(Key, SV1)
+    if (!calculateCMACFull(key, sv1, 32, encKey)) {
         return false;
     }
     
-    // Derive MAC session key
-    // Input: 0x02 || SV || 0x00...0x00 (total 16 bytes)
-    uint8_t macInput[16];
-    macInput[0] = 0x02;
-    memcpy(macInput + 1, sv, 4);
-    memset(macInput + 5, 0x00, 11);
+    // Build SV2 for MAC Key
+    // Same as SV1 but with swapped label: 0x5A 0xA5
+    uint8_t sv2[32];
+    memcpy(sv2, sv1, 32);
+    sv2[0] = 0x5A;
+    sv2[1] = 0xA5;
     
-    if (!aesEncrypt(key, zeroIV, macInput, 16, macKey)) {
+    // Derive MAC key using CMAC(Key, SV2)
+    if (!calculateCMACFull(key, sv2, 32, macKey)) {
         return false;
     }
     
@@ -232,6 +414,73 @@ uint32_t NTAG424Crypto::calculateCRC32(const uint8_t* data, size_t length) {
     }
     
     return ~crc;
+}
+
+// Calculate HMAC-SHA256
+bool NTAG424Crypto::calculateHMAC_SHA256(const uint8_t* key, size_t keyLen,
+                                        const uint8_t* data, size_t dataLen,
+                                        uint8_t* output) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    
+    const mbedtls_md_info_t* md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (md_info == NULL) {
+        mbedtls_md_free(&ctx);
+        return false;
+    }
+    
+    int ret = mbedtls_md_setup(&ctx, md_info, 1); // 1 = HMAC mode
+    if (ret != 0) {
+        mbedtls_md_free(&ctx);
+        return false;
+    }
+    
+    ret = mbedtls_md_hmac_starts(&ctx, key, keyLen);
+    if (ret != 0) {
+        mbedtls_md_free(&ctx);
+        return false;
+    }
+    
+    ret = mbedtls_md_hmac_update(&ctx, data, dataLen);
+    if (ret != 0) {
+        mbedtls_md_free(&ctx);
+        return false;
+    }
+    
+    ret = mbedtls_md_hmac_finish(&ctx, output);
+    if (ret != 0) {
+        mbedtls_md_free(&ctx);
+        return false;
+    }
+    
+    mbedtls_md_free(&ctx);
+    return true;
+}
+
+// Derive master key from master secret using HMAC-SHA256
+bool NTAG424Crypto::deriveMasterKey(const String& masterSecret, const String& uid,
+                                   uint8_t* output, uint8_t keyVersion) {
+    // Prepare data: UID || "K0" || version
+    // Example: "04E1A2B3C4D5E6" + "K0" + "1" = "04E1A2B3C4D5E6K01"
+    String data = uid + "K0" + String(keyVersion);
+    
+    // Convert to bytes
+    const uint8_t* keyBytes = (const uint8_t*)masterSecret.c_str();
+    size_t keyLen = masterSecret.length();
+    
+    const uint8_t* dataBytes = (const uint8_t*)data.c_str();
+    size_t dataLen = data.length();
+    
+    // Calculate HMAC-SHA256
+    uint8_t hmac[32];  // SHA256 = 32 bytes
+    if (!calculateHMAC_SHA256(keyBytes, keyLen, dataBytes, dataLen, hmac)) {
+        return false;
+    }
+    
+    // Take first 16 bytes for AES-128 key
+    memcpy(output, hmac, 16);
+    
+    return true;
 }
 
 // Helper for CMAC subkey generation (not used with mbedtls built-in CMAC)

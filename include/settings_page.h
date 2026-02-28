@@ -215,6 +215,10 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
             🔧 Start Kaart Personalisatie
         </button>
         
+        <button onclick="location.href='/write-cards'" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); margin-top: 10px;">
+            📝 Schrijf Kaarten (Standalone)
+        </button>
+        
         <div class="section-title" style="margin-top: 30px;">Handmatige Masterkey (Optioneel)</div>
         <div class="info-box" style="background: #fff8e1; border-left-color: #ffa500;">
             ⚠️ Alleen gebruiken voor offline personalisatie of testen.<br>

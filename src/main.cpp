@@ -66,6 +66,7 @@ const unsigned long STATS_UPDATE_INTERVAL = 5000; // 5 seconds
 
 void handleMachineMode(NFCReader::CardInfo& cardInfo);
 void handleConfigMode(NFCReader::CardInfo& cardInfo);
+void handleWriteMode(NFCReader::CardInfo& cardInfo);
 void checkConfigButton();
 
 void setup() {
@@ -205,8 +206,12 @@ void loop() {
     // Increment stats
     systemConfig.incrementCardsRead();
     
+    // Check if write mode is active (takes priority over reader mode)
+    if (systemConfig.isWriteActive()) {
+      handleWriteMode(cardInfo);
+    }
     // Handle based on reader mode
-    if (systemConfig.isMachineMode()) {
+    else if (systemConfig.isMachineMode()) {
       handleMachineMode(cardInfo);
     } else if (systemConfig.isConfigMode()) {
       handleConfigMode(cardInfo);
@@ -474,4 +479,215 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
   // Wait for card removal
   Serial.println(F("\n👉 Remove card and present next card to personalize"));
   webServer.broadcastLog("Verwijder kaart - klaar voor volgende kaart", "info");
+}
+
+// ============ WRITE MODE HANDLER (Standalone Key Derivation) ============
+
+void handleWriteMode(NFCReader::CardInfo& cardInfo) {
+  String uid = cardInfo.uidString;
+  Serial.println(F("\n=== WRITE MODE - Standalone Key Derivation ==="));
+  Serial.print(F("Processing card: "));
+  Serial.println(uid);
+  
+  // Broadcast processing status
+  webServer.broadcastWriteCardStatus(uid, "processing", "Kaart gedetecteerd - start schrijven...");
+  
+  // Reset any previous ISO-DEP session
+  if (ntag424Handler != nullptr) {
+    ntag424Handler->resetSession();
+  }
+  
+  // Check if it's actually an NTAG424 DNA card
+  if (cardInfo.cardType.indexOf("NTAG424") < 0 && 
+      cardInfo.cardType.indexOf("DESFire") < 0 &&
+      cardInfo.cardType.indexOf("SECURE") < 0) {
+    String errorMsg = "Geen NTAG424 DNA kaart - type: " + cardInfo.cardType;
+    Serial.print(F("❌ "));
+    Serial.println(errorMsg);
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    return;
+  }
+  
+  // Step 1: Get master secret from config
+  String masterSecret = systemConfig.getMasterSecret();
+  if (masterSecret.length() == 0) {
+    String errorMsg = "Geen master secret beschikbaar";
+    Serial.println(F("❌ No master secret available"));
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    return;
+  }
+  
+  Serial.print(F("🔑 Using master secret: "));
+  Serial.print(masterSecret.substring(0, 4));
+  Serial.println("...");
+  
+  // Step 2: Derive master key from secret + UID
+  webServer.broadcastWriteCardStatus(uid, "processing", "Bereken HMAC uit master secret + UID...");
+  
+  uint8_t derivedKey[16];
+  bool keyDerived = NTAG424Crypto::deriveMasterKey(masterSecret, uid, derivedKey, 1);
+  
+  if (!keyDerived) {
+    String errorMsg = "Key derivation mislukt (HMAC-SHA256 fout)";
+    Serial.println(F("❌ Key derivation failed"));
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    return;
+  }
+  
+  Serial.println(F("✅ Key derived successfully using HMAC-SHA256"));
+  Serial.print(F("Derived K0: "));
+  for (int i = 0; i < 16; i++) {
+    char buf[3];
+    sprintf(buf, "%02X", derivedKey[i]);
+    Serial.print(buf);
+  }
+  Serial.println();
+  
+  // Step 3: Initialize NTAG424 handler
+  if (ntag424Handler == nullptr) {
+    String errorMsg = "NTAG424 handler niet geïnitialiseerd";
+    Serial.println(F("❌ NTAG424 handler not initialized"));
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    return;
+  }
+  
+  // Step 4: Activate ISO-DEP mode
+  webServer.broadcastWriteCardStatus(uid, "processing", "Activeer ISO-DEP communicatie...");
+  
+  if (!ntag424Handler->activateCard()) {
+    String errorMsg = "ISO-DEP activatie mislukt - geen DESFire support?";
+    Serial.println(F("❌ Failed to activate card for ISO-DEP communication"));
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    return;
+  }
+  
+  Serial.println(F("✅ Card activated for ISO-DEP"));
+  
+  // Step 5: Verify card communication with GetVersion
+  webServer.broadcastWriteCardStatus(uid, "processing", "Verifieer kaart communicatie...");
+  
+  uint8_t versionInfo[28];
+  if (!ntag424Handler->getVersion(versionInfo)) {
+    String errorMsg = "Geen communicatie met kaart - controleer kaarttype";
+    Serial.println(F("❌ Failed to communicate with card"));
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    return;
+  }
+  
+  Serial.println(F("✅ Card communication OK"));
+  
+  // Step 6: Determine old key (factory or previous)
+  bool isFactory = systemConfig.getIsFactory();
+  uint8_t oldKey[16];
+  
+  if (isFactory) {
+    // Factory kaart: gebruik default key (0x00...00)
+    memcpy(oldKey, NTAG424Handler::DEFAULT_AES_KEY, 16);
+    Serial.println(F("🔧 Factory kaart: gebruik standaard key (0x00...00)"));
+    webServer.broadcastWriteCardStatus(uid, "processing", "Authenticeer met factory key...");
+  } else {
+    // Reeds gepersonaliseerde kaart: gebruik previous key
+    String prevKeyHex = systemConfig.getPreviousKey();
+    if (prevKeyHex.length() != 32) {
+      String errorMsg = "Vorige key ontbreekt of ongeldig";
+      Serial.println(F("❌ Previous key missing or invalid"));
+      webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+      return;
+    }
+    
+    size_t keyLen = NTAG424Crypto::hexStringToBytes(prevKeyHex, oldKey, 16);
+    if (keyLen != 16) {
+      String errorMsg = "Vorige key conversie mislukt";
+      Serial.println(F("❌ Previous key conversion failed"));
+      webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+      return;
+    }
+    
+    Serial.print(F("🔑 Gepersonaliseerde kaart: gebruik vorige key: "));
+    Serial.println(prevKeyHex.substring(0, 8) + "...");
+    webServer.broadcastWriteCardStatus(uid, "processing", "Authenticeer met vorige key...");
+  }
+  
+  // Step 7: Authenticate with old key FIRST
+  webServer.broadcastWriteCardStatus(uid, "processing", "Authenticeer met oude key...");
+  
+  NTAG424Handler::AuthResult authResult;
+  bool authenticated = ntag424Handler->authenticateEV2First(
+    0,
+    oldKey,
+    authResult
+  );
+  
+  if (!authenticated) {
+    String errorMsg = "Authenticatie mislukt: " + authResult.errorMessage;
+    Serial.print(F("❌ Authentication failed: "));
+    Serial.println(authResult.errorMessage);
+    if (!isFactory) {
+      errorMsg += " (Controleer of vorige key correct is)";
+    }
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    ntag424Handler->resetSession();
+    return;
+  }
+  
+  Serial.println(F("✅ Authentication successful"));
+  
+  // Step 8: Change key 0 (master key) to derived key (using existing auth session)
+  webServer.broadcastWriteCardStatus(uid, "processing", "Schrijf nieuwe masterkey (K0)...");
+  
+  bool keyChanged = ntag424Handler->changeKey(
+    0,  // Key number 0
+    oldKey,  // Old key (factory or previous)
+    derivedKey  // New derived key
+  );
+  
+  if (!keyChanged) {
+    String errorMsg = "Schrijven masterkey mislukt";
+    Serial.println(F("❌ ChangeKey failed"));
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    ntag424Handler->resetSession();
+    return;
+  }
+  
+  Serial.println(F("✅ Master key written successfully"));
+  
+  // Step 9: Verify by authenticating with new key
+  webServer.broadcastWriteCardStatus(uid, "processing", "Verificeer nieuwe key...");
+  
+  NTAG424Handler::AuthResult verifyResult;
+  bool verified = ntag424Handler->authenticateEV2First(
+    0,
+    derivedKey,
+    verifyResult
+  );
+  
+  if (verified) {
+    Serial.println(F("✅✅✅ CARD WRITE COMPLETE! ✅✅✅"));
+    webServer.broadcastWriteCardStatus(uid, "success", "Kaart succesvol geschreven en geverifieerd!");
+    
+    // Check if we're in single mode - if so, stop after one card
+    if (systemConfig.isSingleWriteMode()) {
+      Serial.println(F("Single mode - stopping after one card"));
+      systemConfig.setWriteActive(false);
+      systemConfig.clearMasterSecret();
+      systemConfig.clearPreviousKey();
+      webServer.broadcastLog("Single mode: schrijven gestopt na 1 kaart", "info");
+    }
+  } else {
+    String errorMsg = "Verificatie mislukt: " + verifyResult.errorMessage;
+    Serial.print(F("⚠️ Verification failed: "));
+    Serial.println(verifyResult.errorMessage);
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+  }
+  
+  // Reset ISO-DEP session for next card
+  if (ntag424Handler != nullptr) {
+    ntag424Handler->resetSession();
+  }
+  
+  // In continuous mode, wait for card removal before next
+  if (systemConfig.isWriteActive() && systemConfig.isContinuousWriteMode()) {
+    Serial.println(F("\n👉 Remove card and present next card to write"));
+    webServer.broadcastLog("Verwijder kaart - klaar voor volgende kaart", "info");
+  }
 }

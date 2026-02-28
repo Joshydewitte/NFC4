@@ -15,6 +15,13 @@ private:
     unsigned long startTime;
     uint32_t cardsRead;
     
+    // Write mode settings (runtime only)
+    String writeModeMasterSecret;
+    String writeModePreviousKey;
+    String writeMode;  // "single" or "continuous"
+    bool writeActive;
+    bool writeIsFactory;
+    
 public:
     SystemConfig();
     
@@ -54,6 +61,22 @@ public:
     void incrementCardsRead();
     uint32_t getCardsRead();
     unsigned long getUptime();
+    
+    // ============ WRITE MODE (SESSION ONLY) ============
+    void setMasterSecret(const String& secret);
+    String getMasterSecret();
+    void clearMasterSecret();
+    void setPreviousKey(const String& key);
+    String getPreviousKey();
+    void clearPreviousKey();
+    void setIsFactory(bool factory);
+    bool getIsFactory();
+    void setWriteMode(const String& mode);
+    String getWriteMode();
+    void setWriteActive(bool active);
+    bool isWriteActive();
+    bool isSingleWriteMode();
+    bool isContinuousWriteMode();
     
     // ============ RESET FUNCTIONS ============
     void resetNetwork();

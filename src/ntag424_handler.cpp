@@ -353,44 +353,65 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
 bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8_t* newKey) {
     logToWeb("Start ChangeKey voor key " + String(keyNo), "info");
     
-    // Step 1: Authenticate with old key
-    AuthResult authResult;
-    if (!authenticateEV2First(keyNo, oldKey, authResult)) {
-        logError("Authentication failed: " + authResult.errorMessage);
-        return false;
-    }
-    
-    logToWeb("Authenticatie OK, schrijf nieuwe key...", "info");
-    
+    // Step 1: Authenticate with old key (if not already authenticated)
     if (!authenticated) {
-        logError("Not authenticated - cannot use secure messaging");
-        return false;
+        AuthResult authResult;
+        if (!authenticateEV2First(keyNo, oldKey, authResult)) {
+            logError("Authentication failed: " + authResult.errorMessage);
+            return false;
+        }
+        logToWeb("Authenticatie OK, schrijf nieuwe key...", "info");
+    } else {
+        logToWeb("Gebruik bestaande authenticatie sessie...", "info");
     }
     
     // Step 2: Prepare ChangeKey command data
-    // According to AN12196: ChangeKey ALWAYS uses CommMode.Full
+    // According to AN12196 Section 6.16:
+    // Case 1: KeyNo to be changed ≠ AuthKey → XOR + CRC32 + version
+    // Case 2: KeyNo to be changed = AuthKey → NO XOR, only encrypt new key + version
     
-    // XOR old key with new key
-    uint8_t keyData[16];
-    NTAG424Crypto::xorArrays(oldKey, newKey, keyData, 16);
-    
-    logDebug("XOR Key Data: " + NTAG424Crypto::bytesToHexString(keyData, 16));
-    
-    // Calculate CRC32 over new key (LSB first as per ISO14443)
-    uint32_t crc = NTAG424Crypto::calculateCRC32(newKey, 16);
-    
-    // Prepare plaintext data: [KeyData:16] [CRC32:4] [Padding:12]
-    // Padding to make 32 bytes (2 AES blocks)
     uint8_t plainData[32];
-    memcpy(plainData, keyData, 16);
-    plainData[16] = crc & 0xFF;         // CRC LSB first
-    plainData[17] = (crc >> 8) & 0xFF;
-    plainData[18] = (crc >> 16) & 0xFF;
-    plainData[19] = (crc >> 24) & 0xFF;
     
-    // Apply padding according to ISO/IEC 9797-1 Method 2
-    plainData[20] = 0x80;  // Padding indicator
-    memset(plainData + 21, 0x00, 11);  // Zero padding
+    // Determine which authenticated key we're using
+    // In authenticateEV2First we authenticate with keyNo, so authKeyNo = keyNo
+    uint8_t authKeyNo = keyNo;
+    
+    // FORCE CASE 1 FORMAT (XOR + CRC32) even for same key - test for factory cards
+    bool forceCase1 = true;  // Test hypothesis
+    
+    if (forceCase1 || keyNo != authKeyNo) {
+        // **CASE 1**: Different key - use XOR + CRC32
+        logDebug(forceCase1 ? "ChangeKey: FORCING Case 1 format (XOR + CRC32)" : "ChangeKey Case 1: KeyNo != AuthKey");
+        
+        // XOR old key with new key
+        uint8_t keyData[16];
+        NTAG424Crypto::xorArrays(oldKey, newKey, keyData, 16);
+        logDebug("XOR Key Data: " + NTAG424Crypto::bytesToHexString(keyData, 16));
+        
+        // Calculate CRC32 over new key (LSB first as per ISO14443)
+        uint32_t crc = NTAG424Crypto::calculateCRC32(newKey, 16);
+        logDebug("CRC32: " + String(crc, HEX));
+        
+        // Prepare plaintext: [XOR KeyData:16] [Version:1] [CRC32:4] [Padding:11]
+        memcpy(plainData, keyData, 16);
+        plainData[16] = 0x01;  // Key version
+        plainData[17] = crc & 0xFF;         // CRC LSB first
+        plainData[18] = (crc >> 8) & 0xFF;
+        plainData[19] = (crc >> 16) & 0xFF;
+        plainData[20] = (crc >> 24) & 0xFF;
+        plainData[21] = 0x80;  // Padding indicator
+        memset(plainData + 22, 0x00, 10);  // Zero padding
+        
+    } else {
+        // **CASE 2**: Same key - NO XOR, just encrypt new key directly
+        logDebug("ChangeKey Case 2: KeyNo == AuthKey");
+        
+        // Prepare plaintext: [NewKey:16] [Version:1] [Padding:15]
+        memcpy(plainData, newKey, 16);
+        plainData[16] = 0x00;  // Key version (0x00 for factory cards)
+        plainData[17] = 0x80;  // Padding indicator
+        memset(plainData + 18, 0x00, 14);  // Zero padding
+    }
     
     logDebug("Plain Data: " + NTAG424Crypto::bytesToHexString(plainData, 32));
     
@@ -425,16 +446,21 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     
     // Calculate CMAC according to AN12196 Section 9.1.9
     // CMAC = MACt(SesAuthMACKey, Cmd || CmdCtr || TI || CmdHeader || EncCmdData)
-    uint8_t macInput[39];
-    macInput[0] = CMD_CHANGE_KEY;        // Cmd
-    macInput[1] = commandCounter & 0xFF; // CmdCtr LSB first
+    // Note: CmdCtr is LSB first (same as in IV input!)
+    // Total: 1 + 2 + 4 + 1 + 32 = 40 bytes
+    uint8_t macInput[40];
+    macInput[0] = CMD_CHANGE_KEY;                // Cmd (1 byte)
+    macInput[1] = commandCounter & 0xFF;         // CmdCtr LSB first (2 bytes)
     macInput[2] = (commandCounter >> 8) & 0xFF;
-    memcpy(macInput + 3, transactionId, 4);  // TI
-    macInput[7] = keyNo;  // CmdHeader
-    memcpy(macInput + 8, encKeyData, 32);  // EncCmdData (skip cmd byte for MAC input, already in macInput[0])
+    memcpy(macInput + 3, transactionId, 4);      // TI (4 bytes, MSB first)
+    macInput[7] = keyNo;                         // CmdHeader (1 byte)
+    memcpy(macInput + 8, encKeyData, 32);        // EncCmdData (32 bytes)
+    
+    // Debug: Log complete MAC input for analysis
+    logDebug("MAC Input: " + NTAG424Crypto::bytesToHexString(macInput, 40));
     
     uint8_t mac[8];
-    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 39, mac)) {
+    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 40, mac)) {
         logError("Failed to calculate CMAC");
         return false;
     }
@@ -562,24 +588,27 @@ bool NTAG424Handler::selectNdefApplication() {
 }
 
 bool NTAG424Handler::selectApplication(const uint8_t* aid) {
-    // SelectApplication must use ISO7816 APDU format for NTAG424 DNA
-    // Format: CLA INS P1 P2 Lc Data[3] (Le omitted)
-    uint8_t cmd[8];
-    cmd[0] = 0x00;  // CLA: ISO7816-4 class
-    cmd[1] = CMD_SELECT_APPLICATION;  // INS: 0x5A
-    cmd[2] = 0x04;  // P1: Select by name
+    // SelectApplication uses ISO7816 SELECT command (INS=0x5A) with AID
+    // Must be sent as raw ISO7816 command, NOT wrapped in NTAG424 native format
+    // Format: CLA INS P1 P2 Lc AID[3] Le
+    
+    uint8_t cmd[9];
+    cmd[0] = 0x00;  // CLA: ISO7816-4 standard class
+    cmd[1] = 0x5A;  // INS: SELECT APPLICATION
+    cmd[2] = 0x04;  // P1: Select by name (DF name)
     cmd[3] = 0x00;  // P2: First or only occurrence
     cmd[4] = 0x03;  // Lc: Length of AID (3 bytes)
     memcpy(cmd + 5, aid, 3);  // AID: 3 bytes
+    cmd[8] = 0x00;  // Le: Expect response
     
-    logDebug(">> SelectApp: CLA=0x" + String(cmd[0], HEX) + 
-             " INS=0x" + String(cmd[1], HEX) + 
-             " AID=" + NTAG424Crypto::bytesToHexString(aid, 3));
+    logDebug(">> ISO SELECT Application");
+    logDebug("   AID: " + NTAG424Crypto::bytesToHexString(aid, 3));
     
     uint8_t response[16];
     size_t responseLen = sizeof(response);
     
-    return sendCommand(cmd, 8, response, responseLen);
+    // Send raw ISO7816 command (not wrapped as native command)
+    return transceiveRaw(cmd, 9, response, responseLen);
 }
 
 // Send ISO14443-4 command (NTAG424 native commands wrapped in ISO7816 APDU)

@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include "mbedtls/aes.h"
+#include "mbedtls/md.h"
 
 /**
  * NTAG424 DNA EV2 Authentication & Crypto
@@ -63,15 +64,27 @@ public:
     static void rotateRight(const uint8_t* input, uint8_t* output, size_t length);
     
     /**
-     * Calculate CMAC (Cipher-based Message Authentication Code)
+     * Calculate CMAC using AES-128 according to NIST SP 800-38B
      * @param key - AES key (16 bytes)
-     * @param data - Data to authenticate
-     * @param dataLen - Length of data
-     * @param mac - Output MAC (8 bytes)
+     * @param data - Input data
+     * @param dataLen - Length of input data
+     * @param mac - Output MAC (8 bytes, truncated)
      * @return true on success
      */
-    static bool calculateCMAC(const uint8_t* key, const uint8_t* data, 
+    static bool calculateCMAC(const uint8_t* key, const uint8_t* data,
                              size_t dataLen, uint8_t* mac);
+    
+    /**
+     * Calculate full 16-byte CMAC (not truncated)
+     * Used for session key derivation
+     * @param key - AES key (16 bytes)
+     * @param data - Input data
+     * @param dataLen - Length of input data
+     * @param mac - Output MAC (16 bytes, full)
+     * @return true on success
+     */
+    static bool calculateCMACFull(const uint8_t* key, const uint8_t* data,
+                                  size_t dataLen, uint8_t* mac);
     
     /**
      * XOR two byte arrays
@@ -120,6 +133,31 @@ public:
      * @return 32-bit CRC value
      */
     static uint32_t calculateCRC32(const uint8_t* data, size_t length);
+    
+    /**
+     * Derive master key from master secret using HMAC-SHA256
+     * Formula: K0 = HMAC-SHA256(masterSecret, UID || "K0" || version)[0..15]
+     * @param masterSecret - Master secret string
+     * @param uid - Card UID as hex string (e.g., "04E1A2B3C4D5E6")
+     * @param output - Output buffer for derived key (16 bytes)
+     * @param keyVersion - Key version number (default: 1)
+     * @return true on success
+     */
+    static bool deriveMasterKey(const String& masterSecret, const String& uid,
+                               uint8_t* output, uint8_t keyVersion = 1);
+    
+    /**
+     * Calculate HMAC-SHA256
+     * @param key - Secret key
+     * @param keyLen - Length of key
+     * @param data - Data to authenticate
+     * @param dataLen - Length of data
+     * @param output - Output buffer for HMAC (32 bytes)
+     * @return true on success
+     */
+    static bool calculateHMAC_SHA256(const uint8_t* key, size_t keyLen,
+                                    const uint8_t* data, size_t dataLen,
+                                    uint8_t* output);
                             
 private:
     // Helper for CMAC subkey generation
