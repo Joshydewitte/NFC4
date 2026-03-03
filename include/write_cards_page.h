@@ -369,13 +369,13 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
 
         <!-- Master Secret Input (Only for ESP32 Mode) -->
         <div class="secret-section" id="masterSecretSection">
-            <label class="secret-label">🔐 Master Secret</label>
+            <label class="secret-label">🔐 Master Secret (32 hex karakters = 16 bytes)</label>
             <div class="secret-input-wrapper">
-                <input type="password" id="masterSecret" placeholder="Voer master secret in..." />
+                <input type="password" id="masterSecret" placeholder="00000000000000000000000000000000" maxlength="32" style="text-transform: uppercase;" />
                 <button class="toggle-visibility" id="toggleSecret" type="button">👁️</button>
             </div>
             <div class="secret-help">
-                ℹ️ Dit geheim wordt ALLEEN in geheugen gebruikt en NOOIT opgeslagen
+                ℹ️ Exact 32 hex karakters vereist (0-9, A-F). Dit geheim wordt ALLEEN in geheugen gebruikt.
             </div>
         </div>
 
@@ -389,13 +389,13 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                 </label>
             </div>
             <div id="previousKeySection" style="display: none;">
-                <label class="secret-label">🔑 Vorige Key</label>
+                <label class="secret-label">🔑 Vorige Key (32 hex karakters = 16 bytes)</label>
                 <div class="secret-input-wrapper">
-                    <input type="password" id="previousKey" placeholder="Voer de huidige key van de kaart in..." />
+                    <input type="password" id="previousKey" placeholder="00000000000000000000000000000000" maxlength="32" style="text-transform: uppercase;" />
                     <button class="toggle-visibility" id="togglePrevKey" type="button">👁️</button>
                 </div>
                 <div class="secret-help">
-                    ℹ️ De key die momenteel op de kaart staat (hex, 32 karakters)
+                    ℹ️ Exact 32 hex karakters vereist (0-9, A-F). De key die momenteel op de kaart staat.
                 </div>
             </div>
         </div>
@@ -613,6 +613,30 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             }
         });
 
+        // Hex input filtering for masterSecret (alleen 0-9, A-F, max 32 chars)
+        document.getElementById('masterSecret').addEventListener('input', function(e) {
+            let value = e.target.value.toUpperCase();
+            // Verwijder alles behalve 0-9 en A-F
+            value = value.replace(/[^0-9A-F]/g, '');
+            // Limiteer tot 32 karakters
+            if (value.length > 32) {
+                value = value.substring(0, 32);
+            }
+            e.target.value = value;
+        });
+
+        // Hex input filtering for previousKey (alleen 0-9, A-F, max 32 chars)
+        document.getElementById('previousKey').addEventListener('input', function(e) {
+            let value = e.target.value.toUpperCase();
+            // Verwijder alles behalve 0-9 en A-F
+            value = value.replace(/[^0-9A-F]/g, '');
+            // Limiteer tot 32 karakters
+            if (value.length > 32) {
+                value = value.substring(0, 32);
+            }
+            e.target.value = value;
+        });
+
         // Show/hide previous key section based on factory card checkbox
         document.getElementById('isFactoryCard').addEventListener('change', function() {
             const prevKeySection = document.getElementById('previousKeySection');
@@ -632,20 +656,31 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                     return;
                 }
                 
-                if (masterSecret.length < 16) {
-                    alert('⚠️ Master secret moet minimaal 16 karakters zijn!');
+                if (masterSecret.length !== 32) {
+                    alert('⚠️ Master secret moet exact 32 hex karakters zijn (16 bytes)!');
+                    return;
+                }
+                
+                if (!/^[0-9A-Fa-f]{32}$/.test(masterSecret)) {
+                    alert('⚠️ Master secret moet een geldige hex string zijn (0-9, A-F)');
                     return;
                 }
             }
 
             // Validation for personalized cards (both modes)
             if (!isFactory) {
-                if (!previousKey || previousKey.length !== 32) {
-                    alert('⚠️ Vorige key moet precies 32 hex karakters zijn (16 bytes)');
+                if (!previousKey) {
+                    alert('⚠️ Voer de vorige key in!');
                     return;
                 }
+                
+                if (previousKey.length !== 32) {
+                    alert(`⚠️ Vorige key moet exact 32 hex karakters zijn (16 bytes)\\nJe hebt ${previousKey.length} karakters ingevoerd.`);
+                    return;
+                }
+                
                 if (!/^[0-9A-Fa-f]{32}$/.test(previousKey)) {
-                    alert('⚠️ Vorige key moet een geldige hex string zijn');
+                    alert('⚠️ Vorige key moet een geldige hex string zijn (0-9, A-F)');
                     return;
                 }
             }
@@ -700,27 +735,35 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             
             // Send start command to ESP32
             try {
+                const requestBody = {
+                    keySource: keySource,
+                    masterSecret: keySource === 'esp32' ? masterSecret : '',
+                    mode: currentMode,
+                    isFactory: isFactory,
+                    previousKey: isFactory ? '' : previousKey  // NEVER send null, always string
+                };
+                
+                console.log('Request body:', requestBody);
+                
                 const response = await fetch('/api/write/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        keySource: keySource,
-                        masterSecret: keySource === 'esp32' ? masterSecret : '',
-                        mode: currentMode,
-                        isFactory: isFactory,
-                        previousKey: isFactory ? null : previousKey
-                    })
+                    body: JSON.stringify(requestBody)
                 });
                 
                 const result = await response.json();
+                console.log('Server response:', result);
+                
                 if (result.success) {
                     addLog(result.message, 'success');
                 } else {
-                    addLog(result.message, 'error');
+                    addLog('❌ Server fout: ' + result.message, 'error');
+                    console.error('Server error details:', result);
                     stopWriting();
                 }
             } catch (error) {
                 addLog('Fout bij starten: ' + error, 'error');
+                console.error('Fetch error:', error);
                 stopWriting();
             }
         });

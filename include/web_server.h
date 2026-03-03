@@ -476,57 +476,148 @@ private:
     void handleWriteStart() {
         String body = httpServer.arg("plain");
         
+        Serial.println(F("\n╔═══════════════════════════════════════════╗"));
+        Serial.println(F("║       WRITE START REQUEST RECEIVED       ║"));
+        Serial.println(F("╚═══════════════════════════════════════════╝"));
+        Serial.print(F("Request body: "));
+        Serial.println(body);
+        Serial.println(F("───────────────────────────────────────────"));
+        
         // Parse keySource first
         int sourceStart = body.indexOf("\"keySource\":\"") + 13;
         int sourceEnd = body.indexOf("\"", sourceStart);
         String keySource = body.substring(sourceStart, sourceEnd);
+        Serial.print(F("✓ keySource: "));
+        Serial.println(keySource);
         
         // Parse masterSecret (only required for esp32 mode)
         int secretStart = body.indexOf("\"masterSecret\":\"") + 16;
         int secretEnd = body.indexOf("\"", secretStart);
         String masterSecret = body.substring(secretStart, secretEnd);
+        Serial.print(F("✓ masterSecret length: "));
+        Serial.println(masterSecret.length());
         
         int modeStart = body.indexOf("\"mode\":\"") + 8;
         int modeEnd = body.indexOf("\"", modeStart);
         String mode = body.substring(modeStart, modeEnd);
+        Serial.print(F("✓ mode: "));
+        Serial.println(mode);
         
         // Parse isFactory (boolean)
         bool isFactory = body.indexOf("\"isFactory\":true") > 0;
+        Serial.print(F("✓ isFactory: "));
+        Serial.println(isFactory ? "true" : "false");
         
         // Parse previousKey if not factory
         String previousKey = "";
         if (!isFactory) {
-            int prevKeyStart = body.indexOf("\"previousKey\":\"") + 16;
-            if (prevKeyStart > 15) {  // Found
-                int prevKeyEnd = body.indexOf("\"", prevKeyStart);
-                previousKey = body.substring(prevKeyStart, prevKeyEnd);
+            // Check for null value first
+            if (body.indexOf("\"previousKey\":null") > 0) {
+                Serial.println(F("⚠️  previousKey is null in JSON (should have a value!)"));
+                previousKey = "";  // Will fail validation below
+            } else {
+                int prevKeyPos = body.indexOf("\"previousKey\":\"");
+                if (prevKeyPos >= 0) {  // Found
+                    int prevKeyStart = prevKeyPos + 15;  // Start after "previousKey":"
+                    int prevKeyEnd = body.indexOf("\"", prevKeyStart);
+                    if (prevKeyEnd > prevKeyStart) {
+                        previousKey = body.substring(prevKeyStart, prevKeyEnd);
+                        Serial.print(F("✓ previousKey: "));
+                        Serial.println(previousKey);
+                        Serial.print(F("✓ previousKey length: "));
+                        Serial.println(previousKey.length());
+                    } else {
+                        Serial.println(F("⚠️  Could not find previousKey closing quote!"));
+                    }
+                } else {
+                    Serial.println(F("⚠️  previousKey field not found in JSON!"));
+                }
             }
         }
         
+        Serial.println(F("───────────────────────────────────────────"));
+        Serial.println(F("───────────────────────────────────────────"));
+        
         // Validate keySource
         if (keySource != "esp32" && keySource != "server") {
+            Serial.println(F("❌ VALIDATION FAILED: Invalid keySource"));
             String json = "{\"success\":false,\"message\":\"Ongeldige key source (moet esp32 of server zijn)\"}";
             httpServer.send(400, "application/json", json);
             return;
         }
+        Serial.println(F("✓ keySource valid"));
         
-        // For ESP32 mode, validate masterSecret
-        if (keySource == "esp32" && masterSecret.length() < 16) {
-            String json = "{\"success\":false,\"message\":\"Master secret te kort (min 16 karakters)\"}";
-            httpServer.send(400, "application/json", json);
-            return;
+        // For ESP32 mode, validate masterSecret (exact 32 hex characters = 16 bytes)
+        if (keySource == "esp32") {
+            if (masterSecret.length() != 32) {
+                Serial.print(F("❌ VALIDATION FAILED: masterSecret length is "));
+                Serial.print(masterSecret.length());
+                Serial.println(F(", expected 32"));
+                String json = "{\"success\":false,\"message\":\"Master secret moet exact 32 hex karakters zijn (16 bytes)\"}";
+                httpServer.send(400, "application/json", json);
+                return;
+            }
+            // Validate hex characters
+            for (int i = 0; i < masterSecret.length(); i++) {
+                char c = masterSecret[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                    Serial.print(F("❌ VALIDATION FAILED: Invalid hex char at position "));
+                    Serial.print(i);
+                    Serial.print(F(": '"));
+                    Serial.print(c);
+                    Serial.println(F("'"));
+                    String json = "{\"success\":false,\"message\":\"Master secret moet alleen hex karakters bevatten (0-9, A-F)\"}";
+                    httpServer.send(400, "application/json", json);
+                    return;
+                }
+            }
+            Serial.println(F("✓ masterSecret valid (32 hex chars)"));
         }
         
         if (mode != "single" && mode != "continuous") {
+            Serial.println(F("❌ VALIDATION FAILED: Invalid mode"));
             String json = "{\"success\":false,\"message\":\"Ongeldige mode (moet single of continuous zijn)\"}";
             httpServer.send(400, "application/json", json);
             return;
         }
+        Serial.println(F("✓ mode valid"));
         
-        if (!isFactory && previousKey.length() != 32) {
-            String json = "{\"success\":false,\"message\":\"Vorige key moet 32 hex karakters zijn\"}";
-            httpServer.send(400, "application/json", json);
-            return;
+        // Validate previous key for non-factory cards (MUST be exactly 32 hex characters)
+        if (!isFactory) {
+            Serial.println(F("Validating previousKey for non-factory card..."));
+            
+            if (previousKey.length() == 0) {
+                Serial.println(F("❌ VALIDATION FAILED: previousKey is empty"));
+                String json = "{\"success\":false,\"message\":\"Vorige key is verplicht voor niet-factory kaarten\"}";
+                httpServer.send(400, "application/json", json);
+                return;
+            }
+            
+            if (previousKey.length() != 32) {
+                Serial.print(F("❌ VALIDATION FAILED: previousKey length is "));
+                Serial.print(previousKey.length());
+                Serial.println(F(", expected exactly 32"));
+                String json = "{\"success\":false,\"message\":\"Vorige key moet exact 32 hex karakters zijn (16 bytes)\"}";
+                httpServer.send(400, "application/json", json);
+                return;
+            }
+            
+            // Validate hex characters
+            for (int i = 0; i < previousKey.length(); i++) {
+                char c = previousKey[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                    Serial.print(F("❌ VALIDATION FAILED: Invalid hex char in previousKey at position "));
+                    Serial.print(i);
+                    Serial.print(F(": '"));
+                    Serial.print(c);
+                    Serial.println(F("'"));
+                    String json = "{\"success\":false,\"message\":\"Vorige key moet alleen hex karakters bevatten (0-9, A-F)\"}";
+                    httpServer.send(400, "application/json", json);
+                    return;
+                }
+            }
+            
+            Serial.println(F("✓ previousKey valid (32 hex chars)"));
         }
         
         // Store settings (runtime only, NOT persistent)
