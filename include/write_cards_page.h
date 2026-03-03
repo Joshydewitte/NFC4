@@ -348,10 +348,27 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
         <a href="/settings" class="back-link">← Terug naar instellingen</a>
         
         <h1>📝 Kaarten Schrijven</h1>
-        <p class="subtitle">Personaliseer NTAG424 DNA kaarten met unieke keys</p>
+        <p class="subtitle">⚠️ LET OP: Schrijven kan NIET ongedaan worden gemaakt!</p>
 
-        <!-- Master Secret Input -->
+        <!-- Key Source Selection -->
         <div class="secret-section">
+            <label class="secret-label">🔑 Key Bron</label>
+            <div class="mode-selector">
+                <div class="mode-option active" data-source="esp32">
+                    <div class="mode-icon">📱</div>
+                    <div class="mode-title">ESP32 Mode</div>
+                    <div class="mode-desc">Gebruik lokaal ingevuld secret</div>
+                </div>
+                <div class="mode-option" data-source="server">
+                    <div class="mode-icon">🌐</div>
+                    <div class="mode-title">Server Mode</div>
+                    <div class="mode-desc">Haal keys van server per UID</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Master Secret Input (Only for ESP32 Mode) -->
+        <div class="secret-section" id="masterSecretSection">
             <label class="secret-label">🔐 Master Secret</label>
             <div class="secret-input-wrapper">
                 <input type="password" id="masterSecret" placeholder="Voer master secret in..." />
@@ -383,17 +400,20 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             </div>
         </div>
 
-        <!-- Mode Selection -->
-        <div class="mode-selector">
-            <div class="mode-option active" data-mode="single">
-                <div class="mode-icon">🎯</div>
-                <div class="mode-title">Enkele Kaart</div>
-                <div class="mode-desc">Schrijf één kaart en stop</div>
-            </div>
-            <div class="mode-option" data-mode="continuous">
-                <div class="mode-icon">♾️</div>
-                <div class="mode-title">Continue Modus</div>
-                <div class="mode-desc">Blijf schrijven voor elke kaart</div>
+        <!-- Write Mode Selection -->
+        <div class="secret-section">
+            <label class="secret-label">📝 Schrijf Modus</label>
+            <div class="mode-selector">
+                <div class="mode-option active" data-mode="single">
+                    <div class="mode-icon">🎯</div>
+                    <div class="mode-title">Enkele Kaart</div>
+                    <div class="mode-desc">Schrijf één kaart en stop</div>
+                </div>
+                <div class="mode-option" data-mode="continuous">
+                    <div class="mode-icon">♾️</div>
+                    <div class="mode-title">Continue Modus</div>
+                    <div class="mode-desc">Blijf schrijven voor elke kaart</div>
+                </div>
             </div>
         </div>
 
@@ -435,6 +455,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
         let ws = null;
         let isRunning = false;
         let currentMode = 'single';
+        let keySource = 'esp32';  // NEW: esp32 or server
         let stats = { success: 0, failed: 0, total: 0 };
 
         // Initialize WebSocket connection
@@ -531,17 +552,40 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             logSection.scrollTop = logSection.scrollHeight;
         }
 
-        // Mode selection
-        document.querySelectorAll('.mode-option').forEach(option => {
+        // Key Source selection (ESP32 vs Server)
+        document.querySelectorAll('[data-source]').forEach(option => {
             option.addEventListener('click', function() {
                 if (isRunning) return;
                 
-                document.querySelectorAll('.mode-option').forEach(opt => {
+                document.querySelectorAll('[data-source]').forEach(opt => {
+                    opt.classList.remove('active');
+                });
+                this.classList.add('active');
+                keySource = this.dataset.source;
+                
+                // Show/hide master secret section based on source
+                const masterSecretSection = document.getElementById('masterSecretSection');
+                if (keySource === 'esp32') {
+                    masterSecretSection.style.display = 'block';
+                    addLog('Key bron: ESP32 (lokaal secret)', 'info');
+                } else {
+                    masterSecretSection.style.display = 'none';
+                    addLog('Key bron: Server (haal keys per UID)', 'info');
+                }
+            });
+        });
+
+        // Write Mode selection (Single vs Continuous)
+        document.querySelectorAll('[data-mode]').forEach(option => {
+            option.addEventListener('click', function() {
+                if (isRunning) return;
+                
+                document.querySelectorAll('[data-mode]').forEach(opt => {
                     opt.classList.remove('active');
                 });
                 this.classList.add('active');
                 currentMode = this.dataset.mode;
-                addLog(`Modus gewijzigd naar: ${currentMode === 'single' ? 'Enkele Kaart' : 'Continue'}`, 'info');
+                addLog(`Schrijf modus: ${currentMode === 'single' ? 'Enkele Kaart' : 'Continue'}`, 'info');
             });
         });
 
@@ -575,40 +619,84 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             prevKeySection.style.display = this.checked ? 'none' : 'block';
         });
 
-        // Start writing
+        // Start writing with CONFIRMATION
         document.getElementById('startBtn').addEventListener('click', async function() {
             const masterSecret = document.getElementById('masterSecret').value.trim();
             const isFactory = document.getElementById('isFactoryCard').checked;
             const previousKey = document.getElementById('previousKey').value.trim();
             
-            if (!masterSecret) {
-                alert('Voer eerst een master secret in!');
-                return;
-            }
-            
-            if (masterSecret.length < 16) {
-                alert('Master secret moet minimaal 16 karakters zijn!');
-                return;
+            // Validation for ESP32 mode
+            if (keySource === 'esp32') {
+                if (!masterSecret) {
+                    alert('⚠️ Voer eerst een master secret in!');
+                    return;
+                }
+                
+                if (masterSecret.length < 16) {
+                    alert('⚠️ Master secret moet minimaal 16 karakters zijn!');
+                    return;
+                }
             }
 
+            // Validation for personalized cards (both modes)
             if (!isFactory) {
                 if (!previousKey || previousKey.length !== 32) {
                     alert('⚠️ Vorige key moet precies 32 hex karakters zijn (16 bytes)');
                     return;
                 }
-                // Validate hex format
                 if (!/^[0-9A-Fa-f]{32}$/.test(previousKey)) {
                     alert('⚠️ Vorige key moet een geldige hex string zijn');
                     return;
                 }
             }
             
+            // CRITICAL: CONFIRMATION DIALOG
+            const sourceName = keySource === 'esp32' ? 'ESP32 lokaal secret' : 'Server keys (per UID)';
+            const modeName = currentMode === 'single' ? 'enkele kaart' : 'continue mode';
+            const cardType = isFactory ? 'Factory kaarten (0x00...00)' : 'Gepersonaliseerde kaarten';
+            
+            let confirmMessage = `🚨 BEVESTIG SCHRIJVEN 🚨\\n\\n`;
+            confirmMessage += `Key bron: ${sourceName}\\n`;
+            confirmMessage += `Schrijf modus: ${modeName}\\n`;
+            confirmMessage += `Kaart type: ${cardType}\\n\\n`;
+            
+            if (keySource === 'esp32') {
+                confirmMessage += `Secret (eerste 8): ${masterSecret.substring(0, 8)}...\\n\\n`;
+            }
+            
+            confirmMessage += `⚠️ DIT KAN NIET ONGEDAAN WORDEN!\\n\\n`;
+            confirmMessage += `Weet je ZEKER dat je wilt starten?`;
+            
+            if (!confirm(confirmMessage)) {
+                addLog('❌ Schrijven geannuleerd door gebruiker', 'warning');
+                return;
+            }
+            
+            // SECOND CONFIRMATION FOR ESP32 MODE WITH MASTER SECRET
+            if (keySource === 'esp32') {
+                let secondConfirm = `🔐 VERIFIEER MASTER SECRET 🔐\\n\\n`;
+                secondConfirm += `Je gaat het volgende master secret gebruiken:\\n`;
+                secondConfirm += `\\n"${masterSecret}"\\n\\n`;
+                secondConfirm += `⚠️ CONTROLEER DIT ZORGVULDIG!\\n`;
+                secondConfirm += `Dit secret wordt gebruikt om keys af te leiden.\\n\\n`;
+                secondConfirm += `Klopt dit master secret?`;
+                
+                if (!confirm(secondConfirm)) {
+                    addLog('❌ Master secret verificatie geannuleerd', 'warning');
+                    return;
+                }
+                
+                addLog('✅ Master secret geverifieerd door gebruiker', 'success');
+            }
+            
+            // User confirmed, proceed
             isRunning = true;
             this.style.display = 'none';
             document.getElementById('stopBtn').style.display = 'flex';
             
-            addLog('Start schrijfproces...', 'info');
-            addLog(`Modus: ${currentMode === 'single' ? 'Enkele kaart' : 'Continue'}`, 'info');
+            addLog('✅ Gebruiker heeft schrijven bevestigd', 'success');
+            addLog(`Key bron: ${sourceName}`, 'info');
+            addLog(`Modus: ${modeName}`, 'info');
             
             // Send start command to ESP32
             try {
@@ -616,7 +704,8 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        masterSecret: masterSecret,
+                        keySource: keySource,
+                        masterSecret: keySource === 'esp32' ? masterSecret : '',
                         mode: currentMode,
                         isFactory: isFactory,
                         previousKey: isFactory ? null : previousKey
@@ -658,10 +747,28 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             document.getElementById('stopBtn').style.display = 'none';
         }
 
+        // Stop writing when leaving page
+        window.addEventListener('beforeunload', async function(e) {
+            if (isRunning) {
+                // Send stop request (using sendBeacon for reliability during unload)
+                const data = new Blob([JSON.stringify({})], { type: 'application/json' });
+                navigator.sendBeacon('/api/write/stop', data);
+            }
+        });
+
         // Initialize on page load
-        window.addEventListener('load', function() {
+        window.addEventListener('load', async function() {
+            // IMPORTANT: Stop any active write mode from previous session
+            try {
+                await fetch('/api/write/stop', { method: 'POST' });
+                console.log('Cleaned up any previous write mode');
+            } catch (error) {
+                console.log('Cleanup request failed (may not be active):', error);
+            }
+            
             initWebSocket();
-            addLog('Schrijf-modus geïnitialiseerd', 'success');
+            addLog('📝 Schrijf-modus geïnitialiseerd', 'success');
+            addLog('⚠️ CONFIG MODE SCHRIJFT NIET - gebruik deze pagina!', 'warning');
         });
     </script>
 </body>

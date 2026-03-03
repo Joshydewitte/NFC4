@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include "mbedtls/aes.h"
 #include "mbedtls/md.h"
+#include "mbedtls/cipher.h"
 
 /**
  * NTAG424 DNA EV2 Authentication & Crypto

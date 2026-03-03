@@ -85,104 +85,9 @@ void NTAG424Crypto::rotateRight(const uint8_t* input, uint8_t* output, size_t le
 // Calculate CMAC using AES-128 according to NIST SP 800-38B
 bool NTAG424Crypto::calculateCMAC(const uint8_t* key, const uint8_t* data,
                                   size_t dataLen, uint8_t* mac) {
-    // CMAC-AES-128 implementation per NIST SP 800-38B
-    // https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-38B.pdf
-    
-    const uint8_t Rb = 0x87;  // Constant for AES-128
-    uint8_t zeroIV[16] = {0};
-    
-    // Helper lambda: Left shift array by 1 bit (big-endian byte order)
-    // In big-endian: byte[0] is MSB, byte[15] is LSB
-    // Left shift: carry flows from MSB to LSB (index 0 -> 15)
-    auto leftShift = [](const uint8_t* input, uint8_t* output) {
-        uint8_t carry = 0;
-        for (int i = 0; i < 16; i++) {  // Loop from MSB (0) to LSB (15)
-            uint8_t newCarry = (input[i] & 0x80) >> 7;  // Extract MSB
-            output[i] = (input[i] << 1) | carry;         // Shift and OR with previous carry
-            carry = newCarry;                             // Update carry for next byte
-        }
-    };
-    
-    // Step 1: Generate subkeys K1 and K2
-    // L = AES-128(K, 0^128)
-    uint8_t L[16] = {0};
-    uint8_t zeroBlock[16] = {0};
-    if (!aesEncrypt(key, zeroIV, zeroBlock, 16, L)) {
-        return false;
-    }
-    
-    // K1 = L << 1
-    uint8_t K1[16];
-    leftShift(L, K1);
-    if (L[0] & 0x80) {  // If MSB(L) = 1
-        K1[15] ^= Rb;
-    }
-    
-    // K2 = K1 << 1
-    uint8_t K2[16];
-    leftShift(K1, K2);
-    if (K1[0] & 0x80) {  // If MSB(K1) = 1
-        K2[15] ^= Rb;
-    }
-    
-    // Step 2: Determine number of blocks
-    size_t n = (dataLen + 15) / 16;  // Round up
-    if (n == 0) {
-        n = 1;  // At least one block
-    }
-    
-    bool completeBlock = (dataLen > 0) && (dataLen % 16 == 0);
-    
-    // Step 3: Process all blocks except the last
-    uint8_t state[16] = {0};
-    
-    for (size_t i = 0; i < n - 1; i++) {
-        uint8_t block[16];
-        memcpy(block, data + (i * 16), 16);
-        
-        // XOR with state (CBC mode)
-        for (int j = 0; j < 16; j++) {
-            block[j] ^= state[j];
-        }
-        
-        // Encrypt
-        if (!aesEncrypt(key, zeroIV, block, 16, state)) {
-            return false;
-        }
-    }
-    
-    // Step 4: Process last block with subkey
-    uint8_t lastBlock[16] = {0};
-    size_t lastBlockLen = dataLen - ((n - 1) * 16);
-    
-    if (completeBlock) {
-        // Complete last block: M_last = M_n XOR K1
-        memcpy(lastBlock, data + ((n - 1) * 16), 16);
-        for (int j = 0; j < 16; j++) {
-            lastBlock[j] ^= K1[j];
-        }
-    } else {
-        // Incomplete last block: M_last = (M_n || 10...0) XOR K2
-        if (lastBlockLen > 0) {
-            memcpy(lastBlock, data + ((n - 1) * 16), lastBlockLen);
-        }
-        lastBlock[lastBlockLen] = 0x80;  // Padding
-        for (size_t j = lastBlockLen + 1; j < 16; j++) {
-            lastBlock[j] = 0x00;
-        }
-        for (int j = 0; j < 16; j++) {
-            lastBlock[j] ^= K2[j];
-        }
-    }
-    
-    // XOR with state (CBC mode)
-    for (int j = 0; j < 16; j++) {
-        lastBlock[j] ^= state[j];
-    }
-    
-    // Final encryption
-    uint8_t T[16];
-    if (!aesEncrypt(key, zeroIV, lastBlock, 16, T)) {
+    // First calculate full 16-byte CMAC using mbedTLS
+    uint8_t fullCmac[16];
+    if (!calculateCMACFull(key, data, dataLen, fullCmac)) {
         return false;
     }
     
@@ -190,105 +95,128 @@ bool NTAG424Crypto::calculateCMAC(const uint8_t* key, const uint8_t* data,
     // "Even-numbered bytes" means positions 2, 4, 6, 8, 10, 12, 14, 16
     // Which corresponds to array indices 1, 3, 5, 7, 9, 11, 13, 15 (odd indices)
     // Retained in order (NOT reversed)
-    mac[0] = T[1];
-    mac[1] = T[3];
-    mac[2] = T[5];
-    mac[3] = T[7];
-    mac[4] = T[9];
-    mac[5] = T[11];
-    mac[6] = T[13];
-    mac[7] = T[15];
+    mac[0] = fullCmac[1];
+    mac[1] = fullCmac[3];
+    mac[2] = fullCmac[5];
+    mac[3] = fullCmac[7];
+    mac[4] = fullCmac[9];
+    mac[5] = fullCmac[11];
+    mac[6] = fullCmac[13];
+    mac[7] = fullCmac[15];
     
     return true;
+}
+
+// Helper function for AES-ECB single block encryption (for CMAC)
+static bool aesEcbEncryptBlock(const uint8_t* key, const uint8_t* input, uint8_t* output) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    
+    int ret = mbedtls_aes_setkey_enc(&aes, key, 128);
+    if (ret != 0) {
+        mbedtls_aes_free(&aes);
+        return false;
+    }
+    
+    ret = mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, input, output);
+    mbedtls_aes_free(&aes);
+    
+    return (ret == 0);
+}
+
+// Helper function for left shift by 1 bit (big-endian)
+// NIST SP 800-38B: MSB is leftmost (index 0), LSB is rightmost (index 15)
+// Left shift << 1: bits move left, carry propagates from right to left
+static void leftShift1Bit(const uint8_t* input, uint8_t* output) {
+    uint8_t overflow = 0;
+    // Process from LSB (rightmost, index 15) to MSB (leftmost, index 0)
+    for (int i = 15; i >= 0; i--) {
+        uint8_t newOverflow = (input[i] & 0x80) ? 1 : 0;  // MSB of this byte
+        output[i] = (input[i] << 1) | overflow;  // Shift and add carry from right
+        overflow = newOverflow;
+    }
 }
 
 // Calculate full 16-byte CMAC (not truncated) for session key derivation
 bool NTAG424Crypto::calculateCMACFull(const uint8_t* key, const uint8_t* data,
                                       size_t dataLen, uint8_t* mac) {
-    // Same algorithm as calculateCMAC but returns full 16-byte result
+    // CMAC-AES-128 implementation per NIST SP 800-38B
     const uint8_t Rb = 0x87;
-    uint8_t zeroIV[16] = {0};
     
-    auto leftShift = [](const uint8_t* input, uint8_t* output) {
-        uint8_t carry = 0;
-        for (int i = 0; i < 16; i++) {
-            uint8_t newCarry = (input[i] & 0x80) >> 7;
-            output[i] = (input[i] << 1) | carry;
-            carry = newCarry;
-        }
-    };
-    
-    // Generate subkeys K1 and K2
+    // Step 1: Generate subkeys K1 and K2
+    // L = AES-ECB(K, 0)
     uint8_t L[16] = {0};
     uint8_t zeroBlock[16] = {0};
-    if (!aesEncrypt(key, zeroIV, zeroBlock, 16, L)) {
+    if (!aesEcbEncryptBlock(key, zeroBlock, L)) {
         return false;
     }
     
+    // K1 = L << 1, XOR Rb if MSB(L) = 1
     uint8_t K1[16];
-    leftShift(L, K1);
+    leftShift1Bit(L, K1);
     if (L[0] & 0x80) {
         K1[15] ^= Rb;
     }
     
+    // K2 = K1 << 1, XOR Rb if MSB(K1) = 1
     uint8_t K2[16];
-    leftShift(K1, K2);
+    leftShift1Bit(K1, K2);
     if (K1[0] & 0x80) {
         K2[15] ^= Rb;
     }
     
-    // Determine number of blocks
-    size_t n = (dataLen + 15) / 16;
-    if (n == 0) {
-        n = 1;
-    }
+    // Step 2: Process data
+    size_t n = (dataLen + 15) / 16;  // Number of blocks
+    if (n == 0) n = 1;
     
     bool completeBlock = (dataLen > 0) && (dataLen % 16 == 0);
     
-    // Process all blocks except the last
+    // Process all blocks except last
     uint8_t state[16] = {0};
     
     for (size_t i = 0; i < n - 1; i++) {
         uint8_t block[16];
         memcpy(block, data + (i * 16), 16);
         
+        // XOR with state
         for (int j = 0; j < 16; j++) {
             block[j] ^= state[j];
         }
         
-        if (!aesEncrypt(key, zeroIV, block, 16, state)) {
+        // Encrypt
+        if (!aesEcbEncryptBlock(key, block, state)) {
             return false;
         }
     }
     
-    // Process last block with subkey
+    // Process last block
     uint8_t lastBlock[16] = {0};
     size_t lastBlockLen = dataLen - ((n - 1) * 16);
     
     if (completeBlock) {
+        // Complete block: XOR with K1
         memcpy(lastBlock, data + ((n - 1) * 16), 16);
         for (int j = 0; j < 16; j++) {
             lastBlock[j] ^= K1[j];
         }
     } else {
+        // Incomplete block: pad and XOR with K2
         if (lastBlockLen > 0) {
             memcpy(lastBlock, data + ((n - 1) * 16), lastBlockLen);
         }
-        lastBlock[lastBlockLen] = 0x80;
-        for (size_t j = lastBlockLen + 1; j < 16; j++) {
-            lastBlock[j] = 0x00;
-        }
+        lastBlock[lastBlockLen] = 0x80;  // 10...0 padding
         for (int j = 0; j < 16; j++) {
             lastBlock[j] ^= K2[j];
         }
     }
     
+    // XOR with state
     for (int j = 0; j < 16; j++) {
         lastBlock[j] ^= state[j];
     }
     
-    // Final encryption - return full 16 bytes
-    if (!aesEncrypt(key, zeroIV, lastBlock, 16, mac)) {
+    // Final encryption
+    if (!aesEcbEncryptBlock(key, lastBlock, mac)) {
         return false;
     }
     
@@ -344,12 +272,15 @@ String NTAG424Crypto::bytesToHexString(const uint8_t* bytes, size_t length) {
 bool NTAG424Crypto::deriveSessionKeys(const uint8_t* rndA, const uint8_t* rndB,
                                      const uint8_t* key, uint8_t* encKey,
                                      uint8_t* macKey) {
-    // Session Vector construction (32 bytes):
+    // Session Vector construction (32 bytes) according to AN12196 Table 14 step 25:
     // SV = Label || Counter || Length || Context
-    // Where Context = RndA[15..14] || (RndA[13..8] XOR RndB[15..10]) || RndB[9..0] || RndA[7..0]
+    // Context = RndA[15:14] || (RndA[13:8] XOR RndB[15:10]) || RndB[9:0] || RndA[7:0]
+    //
+    // IMPORTANT: AN12196 uses MSB-first notation:
+    // RndA[15] = first byte (index 0), RndA[0] = last byte (index 15)
     
     // Build SV1 for Encryption Key
-    // Label = 0xA5 0x5A, Counter = 0x00 0x01, Length = 0x00 0x80
+    // Label = 0xA55A, Counter = 0x0001, Length = 0x0080 (128 bits)
     uint8_t sv1[32];
     sv1[0] = 0xA5;
     sv1[1] = 0x5A;
@@ -359,29 +290,48 @@ bool NTAG424Crypto::deriveSessionKeys(const uint8_t* rndA, const uint8_t* rndB,
     sv1[5] = 0x80;
     
     // Context (26 bytes):
-    // RndA[15..14]
-    sv1[6] = rndA[15];
-    sv1[7] = rndA[14];
+    // RndA[15:14] = first 2 bytes (indices 0-1)
+    sv1[6] = rndA[0];
+    sv1[7] = rndA[1];
     
-    // RndA[13..8] XOR RndB[15..10] (6 bytes)
+    // RndA[13:8] XOR RndB[15:10] = 6 bytes
+    // RndA[13:8] = indices 2-7, RndB[15:10] = indices 0-5
     for (int i = 0; i < 6; i++) {
-        sv1[8 + i] = rndA[13 - i] ^ rndB[15 - i];
+        sv1[8 + i] = rndA[2 + i] ^ rndB[i];
     }
     
-    // RndB[9..0] (10 bytes)
+    // RndB[9:0] = 10 bytes (indices 6-15)
     for (int i = 0; i < 10; i++) {
-        sv1[14 + i] = rndB[9 - i];
+        sv1[14 + i] = rndB[6 + i];
     }
     
-    // RndA[7..0] (8 bytes)
+    // RndA[7:0] = last 8 bytes (indices 8-15)
     for (int i = 0; i < 8; i++) {
-        sv1[24 + i] = rndA[7 - i];
+        sv1[24 + i] = rndA[8 + i];
     }
+    
+    // DEBUG: Log SV1 for verification
+    String sv1Hex = "";
+    for (int i = 0; i < 32; i++) {
+        if (sv1[i] < 0x10) sv1Hex += "0";
+        sv1Hex += String(sv1[i], HEX);
+    }
+    sv1Hex.toUpperCase();
+    Serial.println("[DEBUG] SV1: " + sv1Hex);
     
     // Derive ENC key using CMAC(Key, SV1)
     if (!calculateCMACFull(key, sv1, 32, encKey)) {
         return false;
     }
+    
+    // DEBUG: Log ENC key
+    String encKeyHex = "";
+    for (int i = 0; i < 16; i++) {
+        if (encKey[i] < 0x10) encKeyHex += "0";
+        encKeyHex += String(encKey[i], HEX);
+    }
+    encKeyHex.toUpperCase();
+    Serial.println("[DEBUG] ENC Key from CMAC: " + encKeyHex);
     
     // Build SV2 for MAC Key
     // Same as SV1 but with swapped label: 0x5A 0xA5
@@ -390,10 +340,28 @@ bool NTAG424Crypto::deriveSessionKeys(const uint8_t* rndA, const uint8_t* rndB,
     sv2[0] = 0x5A;
     sv2[1] = 0xA5;
     
+    // DEBUG: Log SV2
+    String sv2Hex = "";
+    for (int i = 0; i < 32; i++) {
+        if (sv2[i] < 0x10) sv2Hex += "0";
+        sv2Hex += String(sv2[i], HEX);
+    }
+    sv2Hex.toUpperCase();
+    Serial.println("[DEBUG] SV2: " + sv2Hex);
+    
     // Derive MAC key using CMAC(Key, SV2)
     if (!calculateCMACFull(key, sv2, 32, macKey)) {
         return false;
     }
+    
+    // DEBUG: Log MAC key
+    String macKeyHex = "";
+    for (int i = 0; i < 16; i++) {
+        if (macKey[i] < 0x10) macKeyHex += "0";
+        macKeyHex += String(macKey[i], HEX);
+    }
+    macKeyHex.toUpperCase();
+    Serial.println("[DEBUG] MAC Key from CMAC: " + macKeyHex);
     
     return true;
 }

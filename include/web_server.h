@@ -476,7 +476,12 @@ private:
     void handleWriteStart() {
         String body = httpServer.arg("plain");
         
-        // Parse JSON manually (simple approach)
+        // Parse keySource first
+        int sourceStart = body.indexOf("\"keySource\":\"") + 13;
+        int sourceEnd = body.indexOf("\"", sourceStart);
+        String keySource = body.substring(sourceStart, sourceEnd);
+        
+        // Parse masterSecret (only required for esp32 mode)
         int secretStart = body.indexOf("\"masterSecret\":\"") + 16;
         int secretEnd = body.indexOf("\"", secretStart);
         String masterSecret = body.substring(secretStart, secretEnd);
@@ -498,8 +503,15 @@ private:
             }
         }
         
-        // Validate
-        if (masterSecret.length() < 16) {
+        // Validate keySource
+        if (keySource != "esp32" && keySource != "server") {
+            String json = "{\"success\":false,\"message\":\"Ongeldige key source (moet esp32 of server zijn)\"}";
+            httpServer.send(400, "application/json", json);
+            return;
+        }
+        
+        // For ESP32 mode, validate masterSecret
+        if (keySource == "esp32" && masterSecret.length() < 16) {
             String json = "{\"success\":false,\"message\":\"Master secret te kort (min 16 karakters)\"}";
             httpServer.send(400, "application/json", json);
             return;
@@ -518,7 +530,10 @@ private:
         }
         
         // Store settings (runtime only, NOT persistent)
-        config->setMasterSecret(masterSecret);
+        config->setKeySource(keySource);
+        if (keySource == "esp32") {
+            config->setMasterSecret(masterSecret);
+        }
         config->setIsFactory(isFactory);
         if (!isFactory) {
             config->setPreviousKey(previousKey);
@@ -526,22 +541,48 @@ private:
         config->setWriteMode(mode);
         config->setWriteActive(true);
         
-        String json = "{\"success\":true,\"message\":\"Schrijfproces gestart in " + mode + " modus\"}";
+        // Log for debugging
+        Serial.println(F("\n╔═══════════════════════════════════════════╗"));
+        Serial.println(F("║   WRITE MODE STARTED FROM WEB UI!       ║"));
+        Serial.println(F("╚═══════════════════════════════════════════╝"));
+        Serial.print(F("Key Source: "));
+        Serial.println(keySource);
+        if (keySource == "esp32") {
+            Serial.print(F("Master Secret (first 8): "));
+            Serial.println(masterSecret.substring(0, 8));
+        } else {
+            Serial.println(F("Keys will be fetched from server per UID"));
+        }
+        Serial.print(F("Mode: "));
+        Serial.println(mode);
+        Serial.print(F("Card Type: "));
+        Serial.println(isFactory ? "Factory" : "Personalized");
+        Serial.println(F("═══════════════════════════════════════════\n"));
+        
+        String json = "{\"success\":true,\"message\":\"Schrijfproces gestart in " + mode + " modus met " + keySource + " key source\"}";
         httpServer.send(200, "application/json", json);
         
         String cardType = isFactory ? "factory" : "gepersonaliseerd";
-        broadcastLog("🚀 Schrijfproces gestart (modus: " + mode + ", type: " + cardType + ")", "success");
+        broadcastLog("🚀 Schrijfproces gestart (modus: " + mode + ", source: " + keySource + ", type: " + cardType + ")", "success");
     }
     
     void handleWriteStop() {
+        Serial.println(F("\n╔═══════════════════════════════════════════╗"));
+        Serial.println(F("║     WRITE MODE STOPPED FROM WEB UI!      ║"));
+        Serial.println(F("╚═══════════════════════════════════════════╝"));
+        Serial.println(F("Clearing master secret from RAM..."));
+        Serial.println(F("Resetting key source to ESP32 default..."));
+        Serial.println(F("═══════════════════════════════════════════\n"));
+        
         config->setWriteActive(false);
         config->clearMasterSecret();
         config->clearPreviousKey();
+        config->setKeySource("esp32");  // Reset to default ESP32 mode
         
         String json = "{\"success\":true,\"message\":\"Schrijfproces gestopt\"}";
         httpServer.send(200, "application/json", json);
         
-        broadcastLog("⏹️ Schrijfproces gestopt", "info");
+        broadcastLog("⏹️ Schrijfproces gestopt (key source reset naar ESP32)", "info");
     }
     
     void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {

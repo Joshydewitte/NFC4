@@ -9,7 +9,8 @@ SystemConfig::SystemConfig()
       writeModePreviousKey(""),
       writeMode("single"),
       writeActive(false),
-      writeIsFactory(true) {
+      writeIsFactory(true),
+      keySource("esp32") {  // Default to ESP32 mode
     startTime = millis();
 }
 
@@ -204,6 +205,8 @@ unsigned long SystemConfig::getUptime() {
 void SystemConfig::setMasterSecret(const String& secret) {
     writeModeMasterSecret = secret;
     Serial.println(F("✅ Master secret opgeslagen in RAM (niet persistent)"));
+    Serial.print(F("   Secret preview (first 8): "));
+    Serial.println(secret.substring(0, 8));
 }
 
 String SystemConfig::getMasterSecret() {
@@ -237,6 +240,16 @@ void SystemConfig::setIsFactory(bool factory) {
 
 bool SystemConfig::getIsFactory() {
     return writeIsFactory;
+}
+
+void SystemConfig::setKeySource(const String& source) {
+    keySource = source;
+    Serial.print(F("Key source: "));
+    Serial.println(source);
+}
+
+String SystemConfig::getKeySource() {
+    return keySource;
 }
 
 void SystemConfig::setWriteMode(const String& mode) {

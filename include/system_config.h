@@ -21,6 +21,7 @@ private:
     String writeMode;  // "single" or "continuous"
     bool writeActive;
     bool writeIsFactory;
+    String keySource;  // "esp32" or "server"
     
 public:
     SystemConfig();
@@ -71,6 +72,8 @@ public:
     void clearPreviousKey();
     void setIsFactory(bool factory);
     bool getIsFactory();
+    void setKeySource(const String& source);
+    String getKeySource();
     void setWriteMode(const String& mode);
     String getWriteMode();
     void setWriteActive(bool active);

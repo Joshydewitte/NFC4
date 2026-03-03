@@ -123,6 +123,7 @@ private:
     uint16_t commandCounter;       // CmdCtr - Command Counter (starts at 0 after auth)
     uint8_t sessionEncKey[16];     // Session encryption key
     uint8_t sessionMacKey[16];     // Session MAC key
+    uint8_t currentIV[16];         // Current IV for chained CBC mode (EV2)
     
     // Helper methods
     void logToWeb(const String& message, const String& level = "info");

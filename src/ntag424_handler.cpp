@@ -166,6 +166,7 @@ void NTAG424Handler::resetSession() {
     memset(transactionId, 0, 4);
     memset(sessionEncKey, 0, 16);
     memset(sessionMacKey, 0, 16);
+    memset(currentIV, 0, 16);  // Reset IV for chained CBC
     logDebug("ISO-DEP session reset");
 }
 
@@ -232,9 +233,12 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     logDebug("Rotated RndB': " + NTAG424Crypto::bytesToHexString(rndBPrime, 16));
     
     // Step 5: Concatenate RndA || RndB' and encrypt
+    // According to AN12196 Table 14, use zero IV (NOT encRndB!)
     uint8_t authData[32];
     memcpy(authData, rndA, 16);
     memcpy(authData + 16, rndBPrime, 16);
+    
+    logDebug("Auth Data (RndA || RndB'): " + NTAG424Crypto::bytesToHexString(authData, 32));
     
     uint8_t encAuthData[32];
     if (!NTAG424Crypto::aesEncrypt(key, zeroIV, authData, 32, encAuthData)) {
@@ -277,6 +281,7 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     logDebug("Encrypted Response: " + NTAG424Crypto::bytesToHexString(encResponse, 32));
     
     // Step 7: Decrypt response to get TI || RndA' || PDcap2 || PCDcap2
+    // According to AN12196 Table 14: Card uses ZERO IV for response encryption (not CBC chaining)
     uint8_t decResponse[32];
     if (!NTAG424Crypto::aesDecrypt(key, zeroIV, encResponse, 32, decResponse)) {
         result.errorMessage = "Failed to decrypt final response";
@@ -343,6 +348,11 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     memcpy(sessionEncKey, result.sessionEncKey, 16);
     memcpy(sessionMacKey, result.sessionMacKey, 16);
     
+    // Initialize Current IV for EV2 secure messaging (AN12196 Table 27)
+    // IV chaining starts AFTER authentication - use last block of auth response as initial IV
+    memcpy(this->currentIV, encResponse + 16, 16);
+    logDebug("Current IV initialized: " + NTAG424Crypto::bytesToHexString(this->currentIV, 16));
+    
     result.success = true;
     logToWeb("✅ NTAG424 authenticatie succesvol", "success");
     
@@ -367,8 +377,8 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     
     // Step 2: Prepare ChangeKey command data
     // According to AN12196 Section 6.16:
-    // Case 1: KeyNo to be changed ≠ AuthKey → XOR + CRC32 + version
-    // Case 2: KeyNo to be changed = AuthKey → NO XOR, only encrypt new key + version
+    // Case 1 (Table 26): KeyNo to be changed ≠ AuthKey → XOR + CRC32 + version
+    // Case 2 (Table 27): KeyNo to be changed = AuthKey → NO XOR, only encrypt new key + version
     
     uint8_t plainData[32];
     
@@ -376,12 +386,9 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     // In authenticateEV2First we authenticate with keyNo, so authKeyNo = keyNo
     uint8_t authKeyNo = keyNo;
     
-    // FORCE CASE 1 FORMAT (XOR + CRC32) even for same key - test for factory cards
-    bool forceCase1 = true;  // Test hypothesis
-    
-    if (forceCase1 || keyNo != authKeyNo) {
-        // **CASE 1**: Different key - use XOR + CRC32
-        logDebug(forceCase1 ? "ChangeKey: FORCING Case 1 format (XOR + CRC32)" : "ChangeKey Case 1: KeyNo != AuthKey");
+    if (keyNo != authKeyNo) {
+        // **CASE 1** (AN12196 Table 26): Different key - use XOR + CRC32
+        logDebug("ChangeKey Case 1 (AN12196 §6.16.1): KeyNo != AuthKey");
         
         // XOR old key with new key
         uint8_t keyData[16];
@@ -394,7 +401,7 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
         
         // Prepare plaintext: [XOR KeyData:16] [Version:1] [CRC32:4] [Padding:11]
         memcpy(plainData, keyData, 16);
-        plainData[16] = 0x01;  // Key version
+        plainData[16] = 0x01;  // Key version (AN12196 Table 26)
         plainData[17] = crc & 0xFF;         // CRC LSB first
         plainData[18] = (crc >> 8) & 0xFF;
         plainData[19] = (crc >> 16) & 0xFF;
@@ -403,12 +410,12 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
         memset(plainData + 22, 0x00, 10);  // Zero padding
         
     } else {
-        // **CASE 2**: Same key - NO XOR, just encrypt new key directly
-        logDebug("ChangeKey Case 2: KeyNo == AuthKey");
+        // **CASE 2** (AN12196 Table 27): Same key - NO XOR, just encrypt new key directly
+        logDebug("ChangeKey Case 2 (AN12196 §6.16.2): KeyNo == AuthKey");
         
         // Prepare plaintext: [NewKey:16] [Version:1] [Padding:15]
         memcpy(plainData, newKey, 16);
-        plainData[16] = 0x00;  // Key version (0x00 for factory cards)
+        plainData[16] = 0x01;  // Key version (AN12196 Table 27)
         plainData[17] = 0x80;  // Padding indicator
         memset(plainData + 18, 0x00, 14);  // Zero padding
     }
@@ -426,8 +433,9 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     memset(ivInput + 8, 0x00, 8);  // Zero padding
     
     uint8_t iv[16];
-    uint8_t zeroIV[16] = {0};
-    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, zeroIV, ivInput, 16, iv)) {
+    // EV2 CRITICAL: Use current IV for chaining, not zero!
+    // According to AN12196 Table 27, use "Current IV" from previous operation
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, currentIV, ivInput, 16, iv)) {
         logError("Failed to calculate IV");
         return false;
     }
@@ -449,15 +457,24 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     // Note: CmdCtr is LSB first (same as in IV input!)
     // Total: 1 + 2 + 4 + 1 + 32 = 40 bytes
     uint8_t macInput[40];
+    // AN12196 Table 27 Step 14: MAC Input = Cmd || CmdCtr || TI || CmdHeader || EncCmdData
     macInput[0] = CMD_CHANGE_KEY;                // Cmd (1 byte)
     macInput[1] = commandCounter & 0xFF;         // CmdCtr LSB first (2 bytes)
     macInput[2] = (commandCounter >> 8) & 0xFF;
     memcpy(macInput + 3, transactionId, 4);      // TI (4 bytes, MSB first)
-    macInput[7] = keyNo;                         // CmdHeader (1 byte)
+    macInput[7] = keyNo;                         // CmdHeader = KeyNo (1 byte)
     memcpy(macInput + 8, encKeyData, 32);        // EncCmdData (32 bytes)
     
     // Debug: Log complete MAC input for analysis
     logDebug("MAC Input: " + NTAG424Crypto::bytesToHexString(macInput, 40));
+    
+    // Calculate full CMAC first for debugging
+    uint8_t macFull[16];
+    if (!NTAG424Crypto::calculateCMACFull(sessionMacKey, macInput, 40, macFull)) {
+        logError("Failed to calculate full CMAC");
+        return false;
+    }
+    logDebug("CMAC Full: " + NTAG424Crypto::bytesToHexString(macFull, 16));
     
     uint8_t mac[8];
     if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 40, mac)) {
@@ -487,6 +504,11 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     // Increment command counter after successful command
     commandCounter++;
     logDebug("CmdCtr incremented to: " + String(commandCounter));
+    
+    // Update Current IV for next operation (EV2 chained CBC mode)
+    // Use last ciphertext block (last 16 bytes of encrypted command data)
+    memcpy(this->currentIV, encKeyData + 16, 16);
+    logDebug("Current IV updated: " + NTAG424Crypto::bytesToHexString(this->currentIV, 16));
     
     // Response should contain MAC, verify it
     // For now, just check if we got SW=9100
