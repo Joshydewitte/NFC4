@@ -390,12 +390,21 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             </div>
             <div id="previousKeySection" style="display: none;">
                 <label class="secret-label">🔑 Vorige Key (32 hex karakters = 16 bytes)</label>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="isDirectKey" style="width: 18px; height: 18px;" />
+                        <span>Direct Key Mode (vorige key is afgeleide AES key, niet master secret)</span>
+                    </label>
+                </div>
                 <div class="secret-input-wrapper">
                     <input type="password" id="previousKey" placeholder="00000000000000000000000000000000" maxlength="32" style="text-transform: uppercase;" />
                     <button class="toggle-visibility" id="togglePrevKey" type="button">👁️</button>
                 </div>
-                <div class="secret-help">
-                    ℹ️ Exact 32 hex karakters vereist (0-9, A-F). De key die momenteel op de kaart staat.
+                <div class="secret-help" id="prevKeyHelpNormal">
+                    ℹ️ Exact 32 hex karakters vereist (0-9, A-F). Het master secret dat eerder gebruikt werd.
+                </div>
+                <div class="secret-help" id="prevKeyHelpDirect" style="display: none; color: #ff9800;">
+                    ⚠️ Direct Key Mode: Vul hier de berekende AES-128 key in (32 hex chars).
                 </div>
             </div>
         </div>
@@ -642,11 +651,25 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             const prevKeySection = document.getElementById('previousKeySection');
             prevKeySection.style.display = this.checked ? 'none' : 'block';
         });
+        
+        // Show/hide help text based on Direct Key checkbox
+        document.getElementById('isDirectKey').addEventListener('change', function() {
+            const helpNormal = document.getElementById('prevKeyHelpNormal');
+            const helpDirect = document.getElementById('prevKeyHelpDirect');
+            if (this.checked) {
+                helpNormal.style.display = 'none';
+                helpDirect.style.display = 'block';
+            } else {
+                helpNormal.style.display = 'block';
+                helpDirect.style.display = 'none';
+            }
+        });
 
         // Start writing with CONFIRMATION
         document.getElementById('startBtn').addEventListener('click', async function() {
             const masterSecret = document.getElementById('masterSecret').value.trim();
             const isFactory = document.getElementById('isFactoryCard').checked;
+            const isDirectKey = document.getElementById('isDirectKey').checked;
             const previousKey = document.getElementById('previousKey').value.trim();
             
             // Validation for ESP32 mode
@@ -740,6 +763,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                     masterSecret: keySource === 'esp32' ? masterSecret : '',
                     mode: currentMode,
                     isFactory: isFactory,
+                    isDirectKey: isDirectKey,
                     previousKey: isFactory ? '' : previousKey  // NEVER send null, always string
                 };
                 

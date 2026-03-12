@@ -21,6 +21,7 @@ private:
     String writeMode;  // "single" or "continuous"
     bool writeActive;
     bool writeIsFactory;
+    bool writeIsDirectKey;  // true = Previous Key is direct key, false = Previous Key is master secret
     String keySource;  // "esp32" or "server"
     
 public:
@@ -72,6 +73,8 @@ public:
     void clearPreviousKey();
     void setIsFactory(bool factory);
     bool getIsFactory();
+    void setIsDirectKey(bool direct);
+    bool getIsDirectKey();
     void setKeySource(const String& source);
     String getKeySource();
     void setWriteMode(const String& mode);

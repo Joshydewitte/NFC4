@@ -138,19 +138,177 @@ public:
         return challengeData;
     }
     
-    bool verifyResponse(const String& cardUID, const String& response) {
+    // Request initial challenge (no UID required) - for pre-caching
+    struct ChallengeData {
+        String challenge;
+        String challengeId;
+        bool success;
+    };
+    
+    ChallengeData requestInitialChallenge() {
+        ChallengeData result;
+        result.success = false;
+        
+        if (serverUrl.isEmpty()) {
+            Serial.println(F("No server configured"));
+            return result;
+        }
+        
+        Serial.println(F("📤 Requesting initial challenge..."));
+        
+        // Server API: GET /api/challenge/initial
+        http.begin(serverUrl + "/api/challenge/initial");
+        http.setTimeout(5000);
+        
+        int httpCode = http.GET();
+        
+        if (httpCode == 200) {
+            String response = http.getString();
+            
+            StaticJsonDocument<512> responseDoc;
+            DeserializationError error = deserializeJson(responseDoc, response);
+            
+            if (!error && responseDoc.containsKey("challenge") && responseDoc.containsKey("challengeId")) {
+                result.challenge = responseDoc["challenge"].as<String>();
+                result.challengeId = responseDoc["challengeId"].as<String>();
+                result.success = true;
+                
+                Serial.println(F("✅ Initial challenge received"));
+                Serial.print(F("   Challenge ID: "));
+                Serial.println(result.challengeId);
+                Serial.print(F("   Challenge: "));
+                Serial.println(result.challenge);
+            } else {
+                Serial.println(F("❌ Invalid challenge response"));
+            }
+        } else {
+            Serial.print(F("❌ Challenge request failed: "));
+            Serial.println(httpCode);
+        }
+        
+        http.end();
+        return result;
+    }
+    
+    // Send scan with crypto proof, receive result + next challenge
+    struct ScanResult {
+        bool success;
+        String status;          // "known", "unknown", "challenge_failed"
+        int credits;
+        String message;
+        String nextChallenge;   // For next card scan
+        String nextChallengeId; // ID for next challenge
+    };
+    
+    ScanResult scanWithProof(const String& cardUID, const String& encRndB, 
+                             const String& encResponse, const String& transactionId,
+                             const String& challengeId) {
+        ScanResult result;
+        result.success = false;
+        result.credits = 0;
+        
+        if (serverUrl.isEmpty()) {
+            Serial.println(F("❌ No server configured"));
+            result.status = "error";
+            result.message = "No server configured";
+            return result;
+        }
+        
+        Serial.println(F("📤 Sending scan with crypto proof..."));
+        logToWeb("📤 Scan met crypto proof verzenden...", "info");
+        
+        // Server API: POST /api/scan-with-proof
+        // Body: { uid, encRndB, encResponse, transactionId, challengeId }
+        StaticJsonDocument<1024> requestDoc;
+        requestDoc["uid"] = cardUID;
+        requestDoc["encRndB"] = encRndB;
+        requestDoc["encResponse"] = encResponse;
+        requestDoc["transactionId"] = transactionId;
+        requestDoc["challengeId"] = challengeId;
+        
+        String requestBody;
+        serializeJson(requestDoc, requestBody);
+        
+        http.begin(serverUrl + "/api/scan-with-proof");
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(5000);
+        
+        int httpCode = http.POST(requestBody);
+        
+        if (httpCode == 200) {
+            String responseStr = http.getString();
+            
+            StaticJsonDocument<1024> responseDoc;
+            DeserializationError error = deserializeJson(responseDoc, responseStr);
+            
+            if (!error) {
+                result.success = true;
+                result.status = responseDoc["status"].as<String>();
+                result.credits = responseDoc["credits"] | 0;
+                result.message = responseDoc["message"].as<String>();
+                result.nextChallenge = responseDoc["nextChallenge"].as<String>();
+                result.nextChallengeId = responseDoc["nextChallengeId"].as<String>();
+                
+                Serial.print(F("✅ Scan result: "));
+                Serial.println(result.status);
+                Serial.print(F("   Credits: "));
+                Serial.println(result.credits);
+                Serial.print(F("   Message: "));
+                Serial.println(result.message);
+                Serial.print(F("   Next challenge ID: "));
+                Serial.println(result.nextChallengeId);
+                Serial.print(F("   Next challenge: "));
+                Serial.println(result.nextChallenge);
+                
+                logToWeb("✅ Scan result: " + result.status, "success");
+                if (result.credits > 0) {
+                    logToWeb("💰 Credits: " + String(result.credits), "success");
+                }
+                logToWeb(result.message, "info");
+            } else {
+                Serial.println(F("❌ Invalid JSON response"));
+                result.status = "error";
+                result.message = "Invalid server response";
+            }
+        } else {
+            Serial.print(F("❌ Scan request failed: HTTP "));
+            Serial.println(httpCode);
+            result.status = "error";
+            result.message = "HTTP " + String(httpCode);
+            logToWeb("❌ Scan request mislukt: HTTP " + String(httpCode), "error");
+        }
+        
+        http.end();
+        return result;
+    }
+    
+    bool verifyResponse(const String& cardUID, const String& response, const String& rndB = "", const String& transactionId = "") {
         if (serverUrl.isEmpty()) {
             logToWeb("❌ Geen server geconfigureerd voor verificatie", "error");
             return false;
         }
         
-        logToWeb("🔐 Response naar server sturen voor verificatie", "info");
+        bool cryptoMode = (rndB.length() > 0 && transactionId.length() > 0);
+        
+        if (cryptoMode) {
+            logToWeb("🔐 Full EV2 Crypto verificatie", "success");
+        } else {
+            logToWeb("🔐 Mock mode verificatie (geen crypto)", "warning");
+        }
         logToWeb("   Response: " + response.substring(0, 16) + "...", "info");
         
-        // Server API: POST /api/verify with body {uid, response}
+        // Server API: POST /api/verify with body {uid, response, rndB, transactionId}
         StaticJsonDocument<512> requestDoc;
         requestDoc["uid"] = cardUID;
         requestDoc["response"] = response;
+        
+        // Add crypto fields if available
+        if (cryptoMode) {
+            requestDoc["rndB"] = rndB;
+            requestDoc["transactionId"] = transactionId;
+            logToWeb("   RndB: " + rndB.substring(0, 16) + "...", "info");
+            logToWeb("   TI: " + transactionId, "info");
+        }
         
         String requestBody;
         serializeJson(requestDoc, requestBody);
@@ -406,6 +564,63 @@ public:
         
         http.POST(requestBody);
         http.end();
+    }
+    
+    // ============ CARD SCAN LOGGING ============
+    
+    bool sendScan(const String& cardUID, const String& cardStatus) {
+        if (serverUrl.isEmpty()) {
+            Serial.println(F("No server configured - scan not logged"));
+            return false;
+        }
+        
+        // Determine isPersonalized boolean from string status
+        bool isPersonalized = false;
+        if (cardStatus == "personalized" || cardStatus == "gedoopt") {
+            isPersonalized = true;
+        } else if (cardStatus == "factory") {
+            isPersonalized = false;
+        }
+        // For "unknown", leave as false
+        
+        // Server API: POST /api/scan
+        // Expected: { uid, readerName, isPersonalized }
+        StaticJsonDocument<512> requestDoc;
+        requestDoc["uid"] = cardUID;
+        requestDoc["readerName"] = WiFi.macAddress(); // Use MAC as reader identifier
+        requestDoc["isPersonalized"] = isPersonalized;
+        
+        String requestBody;
+        serializeJson(requestDoc, requestBody);
+        
+        Serial.println(F("📤 Sending scan to server..."));
+        Serial.print(F("   UID: "));
+        Serial.println(cardUID);
+        Serial.print(F("   Status: "));
+        Serial.println(cardStatus);
+        Serial.print(F("   isPersonalized: "));
+        Serial.println(isPersonalized ? "true" : "false");
+        
+        http.begin(serverUrl + "/api/scan");
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(5000);
+        
+        int httpCode = http.POST(requestBody);
+        bool success = false;
+        
+        if (httpCode == 200) {
+            String response = http.getString();
+            Serial.println(F("✅ Scan logged to server"));
+            Serial.print(F("   Response: "));
+            Serial.println(response);
+            success = true;
+        } else {
+            Serial.print(F("❌ Scan logging failed: HTTP "));
+            Serial.println(httpCode);
+        }
+        
+        http.end();
+        return success;
     }
 };
 

@@ -22,6 +22,8 @@ public:
     static const uint8_t CMD_AUTHENTICATE_EV2_FIRST = 0x71;
     static const uint8_t CMD_AUTHENTICATE_EV2_NON_FIRST = 0x77;
     static const uint8_t CMD_CHANGE_KEY = 0xC4;
+    static const uint8_t CMD_CHANGE_KEY_SETTINGS = 0x54;
+    static const uint8_t CMD_GET_KEY_SETTINGS = 0x45;
     static const uint8_t CMD_GET_VERSION = 0x60;
     static const uint8_t CMD_SELECT_APPLICATION = 0x5A;
     
@@ -39,6 +41,12 @@ public:
         uint8_t sessionEncKey[16];
         uint8_t sessionMacKey[16];
         String errorMessage;
+        
+        // Additional fields for server verification
+        uint8_t encryptedRndB[16];      // Encrypted RndB from card
+        uint8_t encryptedResponse[32];  // Encrypted response from card (TI||RndA'||PDcap2||PCDcap2)
+        uint8_t transactionId[4];        // Transaction ID (TI)
+        uint8_t rndA[16];                // RndA used in authentication
     };
     
     NTAG424Handler(PN5180ISO14443* nfcReader);
@@ -71,6 +79,16 @@ public:
     bool authenticateEV2First(uint8_t keyNo, const uint8_t* key, AuthResult& result);
     
     /**
+     * Authenticate with NTAG424 DNA using EV2 First with external RndA
+     * @param keyNo - Key number (0-4)
+     * @param key - AES-128 key (16 bytes)
+     * @param externalRndA - External RndA (16 bytes, e.g., from server challenge)
+     * @param result - Output: authentication result and session keys
+     * @return true on success
+     */
+    bool authenticateEV2First(uint8_t keyNo, const uint8_t* key, const uint8_t* externalRndA, AuthResult& result);
+    
+    /**
      * Change a key on NTAG424 DNA
      * @param keyNo - Key number to change (0-4)
      * @param oldKey - Old key for authentication (16 bytes)
@@ -78,6 +96,30 @@ public:
      * @return true on success
      */
     bool changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8_t* newKey);
+    
+    /**
+     * Change key settings (authenticated command)
+     * Must be authenticated before calling
+     * @param settings - Key settings byte (see AN12196 Table 20)
+     * @return true on success
+     */
+    bool changeKeySettings(uint8_t settings);
+    
+    /**
+     * Commit transaction (makes ChangeKey permanent)
+     * Must be called after ChangeKey to commit changes
+     * @return true on success
+     */
+    bool commitTransaction();
+    
+    /**
+     * Get key settings (authenticated command)
+     * Shows if ChangeKey is allowed and configuration
+     * @param settings - Output: key settings byte
+     * @param maxKeys - Output: maximum number of keys
+     * @return true on success
+     */
+    bool getKeySettings(uint8_t& settings, uint8_t& maxKeys);
     
     /**
      * Get version information from NTAG424 DNA
@@ -119,6 +161,7 @@ private:
     
     // Secure messaging state (valid after successful authentication)
     bool authenticated;
+    uint8_t authenticatedKeyNo;    // Key number used for authentication
     uint8_t transactionId[4];      // TI - Transaction Identifier
     uint16_t commandCounter;       // CmdCtr - Command Counter (starts at 0 after auth)
     uint8_t sessionEncKey[16];     // Session encryption key

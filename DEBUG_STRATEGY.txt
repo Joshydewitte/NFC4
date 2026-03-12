@@ -1,0 +1,36 @@
+Test strategie:
+
+Het probleem: ALLE keys falen met SW=91AE (authentication error)
+
+Logische analyse:
+1. SW=91AE is een expliciete "verkeerde key" error van de kaart
+2. Dit betekent dat de kaart communiceert en het authenticatie commando begrijpt
+3. Maar de kaart zegt dat ELKE key die we proberen verkeerd is
+
+Mogelijke oorzaken (van meest naar minst waarschijnlijk):
+
+A. **We sturen de verkeerde key bytes naar de kaart**
+   - Hex-to-bytes conversie gaat fout
+   - Test: Print de exacte bytes die naar authenticateEV2First gaan
+
+B. **De kaart gebruikt een ander key nummer dan 0**
+   - We doen altijd authenticateEV2First(0, ...)
+   - Misschien moeten we een ander key nummer gebruiken
+   - Test: Probeer key nummer 1, 2, 3, 4
+
+C. **SELECT APPLICATION is fout**
+   - De kaart is in de verkeerde applicatie
+   - Test: Check of selectNdefApplication() succesvol is
+
+D. **AES decrypt/encrypt in authentication gaat fout**
+   - De RndB decryptie/RndA encryptie is incorrect
+   - Dit zou betekenen dat mbedTLS iets verkeerd doet
+   - Test: Hard-code een known-good authentication handshake
+
+ACTIEPLAN:
+1. Voeg VEEL meer logging toe in authenticateEV2First
+2. Print EXACT de keyNo en key bytes die worden gebruikt
+3. Print EXACT de encRndB die van de kaart komt
+4. Print EXACT de authData die we terugsturen
+
+Dan kunnen we zien waar het mis gaat.

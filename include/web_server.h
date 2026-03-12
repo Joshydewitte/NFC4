@@ -508,6 +508,11 @@ private:
         Serial.print(F("✓ isFactory: "));
         Serial.println(isFactory ? "true" : "false");
         
+        // Parse isDirectKey (boolean)
+        bool isDirectKey = body.indexOf("\"isDirectKey\":true") > 0;
+        Serial.print(F("✓ isDirectKey: "));
+        Serial.println(isDirectKey ? "true (previous key is AES key)" : "false (previous key is master secret)");
+        
         // Parse previousKey if not factory
         String previousKey = "";
         if (!isFactory) {
@@ -626,6 +631,7 @@ private:
             config->setMasterSecret(masterSecret);
         }
         config->setIsFactory(isFactory);
+        config->setIsDirectKey(isDirectKey);
         if (!isFactory) {
             config->setPreviousKey(previousKey);
         }

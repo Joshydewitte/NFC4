@@ -91,10 +91,9 @@ bool NTAG424Crypto::calculateCMAC(const uint8_t* key, const uint8_t* data,
         return false;
     }
     
-    // Truncate MAC according to NTAG424 specification (NIST SP 800-38B):
-    // "Even-numbered bytes" means positions 2, 4, 6, 8, 10, 12, 14, 16
-    // Which corresponds to array indices 1, 3, 5, 7, 9, 11, 13, 15 (odd indices)
-    // Retained in order (NOT reversed)
+    // Truncate MAC according to AN12196 Section 9.1.9 & Table 27:
+    // NTAG424 DNA EV2 uses ODD INDICES truncation (1,3,5,7,9,11,13,15)
+    // NOT the first 8 bytes!
     mac[0] = fullCmac[1];
     mac[1] = fullCmac[3];
     mac[2] = fullCmac[5];
@@ -428,20 +427,53 @@ bool NTAG424Crypto::calculateHMAC_SHA256(const uint8_t* key, size_t keyLen,
 // Derive master key from master secret using HMAC-SHA256
 bool NTAG424Crypto::deriveMasterKey(const String& masterSecret, const String& uid,
                                    uint8_t* output, uint8_t keyVersion) {
-    // Prepare data: UID || "K0" || version
-    // Example: "04E1A2B3C4D5E6" + "K0" + "1" = "04E1A2B3C4D5E6K01"
-    String data = uid + "K0" + String(keyVersion);
+    // Convert master secret from hex string to bytes
+    uint8_t masterSecretBytes[16];
+    if (masterSecret.length() != 32) {
+        return false;  // Must be 32 hex chars = 16 bytes
+    }
+    for (int i = 0; i < 16; i++) {
+        char hex[3] = {masterSecret[i*2], masterSecret[i*2+1], 0};
+        masterSecretBytes[i] = (uint8_t)strtol(hex, NULL, 16);
+    }
     
-    // Convert to bytes
-    const uint8_t* keyBytes = (const uint8_t*)masterSecret.c_str();
-    size_t keyLen = masterSecret.length();
+    // Convert UID from hex string to bytes
+    // CRITICAL: Remove colons first (UID string format is "04:3F:7B:...")
+    String cleanUid = uid;
+    cleanUid.replace(":", "");
+    cleanUid.replace(" ", "");
+    cleanUid.replace("-", "");
+    cleanUid.toUpperCase();
     
-    const uint8_t* dataBytes = (const uint8_t*)data.c_str();
-    size_t dataLen = data.length();
+    size_t uidLen = cleanUid.length() / 2;
+    if (cleanUid.length() % 2 != 0 || uidLen > 16) {
+        return false;  // Invalid UID format
+    }
+    uint8_t uidBytes[16];
+    for (size_t i = 0; i < uidLen; i++) {
+        char hex[3] = {cleanUid[i*2], cleanUid[i*2+1], 0};
+        uidBytes[i] = (uint8_t)strtol(hex, NULL, 16);
+    }
+    
+    // Prepare data: UID (raw bytes) || "K0" (ASCII) || version (byte)
+    // Example: [0x04, 0xE1, 0xA2, ... ] + ['K', '0'] + [0x01]
+    uint8_t data[32];  // Max UID(16) + label(2) + version(1)
+    size_t dataLen = 0;
+    
+    // Copy UID bytes
+    memcpy(data + dataLen, uidBytes, uidLen);
+    dataLen += uidLen;
+    
+    // Add "K0" as ASCII
+    data[dataLen++] = 'K';
+    data[dataLen++] = '0';
+    
+    // Add version byte
+    data[dataLen++] = keyVersion;
     
     // Calculate HMAC-SHA256
     uint8_t hmac[32];  // SHA256 = 32 bytes
-    if (!calculateHMAC_SHA256(keyBytes, keyLen, dataBytes, dataLen, hmac)) {
+    if (!calculateHMAC_SHA256(masterSecretBytes, 16, data, dataLen, hmac)) {
         return false;
     }
     

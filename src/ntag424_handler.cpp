@@ -2,6 +2,12 @@
 #include "web_server.h"
 #include <PN5180.h>
 
+// ============ DEBUG MODE ============
+// When true: Prepare all crypto but DON'T write to card
+// Show all debug output for verification before enabling real writes
+#define DEBUG_WRITE_MODE true  // 🔍 DEBUG ONLY: NO writes to card!
+// ====================================
+
 // Default factory AES key (all zeros)
 const uint8_t NTAG424Handler::DEFAULT_AES_KEY[16] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -162,6 +168,7 @@ bool NTAG424Handler::activateCard() {
 void NTAG424Handler::resetSession() {
     isoDEPActive = false;
     authenticated = false;
+    authenticatedKeyNo = 0xFF;  // Invalid key number
     commandCounter = 0;
     memset(transactionId, 0, 4);
     memset(sessionEncKey, 0, 16);
@@ -175,8 +182,11 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     result.success = false;
     result.errorMessage = "";
     
-    logDebug("Start EV2 First Authentication");
+    logDebug("═══════════════════════════════════════════════════════");
+    logDebug("START EV2 FIRST AUTHENTICATION - DETAILED DEBUG");
+    logDebug("═══════════════════════════════════════════════════════");
     logDebug("Key Number: " + String(keyNo));
+    logDebug("Key being used: " + NTAG424Crypto::bytesToHexString(key, 16));
     
     // Step 1: Send AuthenticateEV2First command
     // NTAG424 expects: 0x71 || KeyNo || LenCap (3 bytes total)
@@ -185,14 +195,23 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     cmd[1] = keyNo;                        // Key number
     cmd[2] = 0x00;                         // LenCap (standard frame size)
     
+    logDebug("Sending authentication command...");
+    
     uint8_t response[64];
     size_t responseLen = sizeof(response);
     
     if (!sendCommand(cmd, 3, response, responseLen)) {
-        result.errorMessage = "Failed to send auth command";
+        result.errorMessage = "Failed to send auth command - SW=" + String(lastStatusWord, HEX);
         logError(result.errorMessage);
+        logError("⚠️ This usually means:");
+        logError("  - Wrong key number");
+        logError("  - Card not in correct state");
+        logError("  - Card communication problem");
         return false;
     }
+    
+    logDebug("✓ Command sent successfully");
+    logDebug("Response length: " + String(responseLen) + " bytes");
     
     // Response should be: [16 bytes encrypted RndB]
     // Note: Status word (SW1 SW2) is already removed by sendCommand()
@@ -205,6 +224,9 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     // Extract encrypted RndB (16 bytes)
     uint8_t encRndB[16];
     memcpy(encRndB, response, 16);
+    
+    // Store encrypted RndB in result for server verification
+    memcpy(result.encryptedRndB, encRndB, 16);
     
     logDebug("Encrypted RndB: " + NTAG424Crypto::bytesToHexString(encRndB, 16));
     
@@ -223,6 +245,9 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     // Step 3: Generate RndA (16 bytes)
     uint8_t rndA[16];
     NTAG424Crypto::generateRandom(rndA, 16);
+    
+    // Store RndA in result for server verification
+    memcpy(result.rndA, rndA, 16);
     
     logDebug("Generated RndA: " + NTAG424Crypto::bytesToHexString(rndA, 16));
     
@@ -278,6 +303,9 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     uint8_t encResponse[32];
     memcpy(encResponse, response, 32);
     
+    // Store encrypted response in result for server verification
+    memcpy(result.encryptedResponse, encResponse, 32);
+    
     logDebug("Encrypted Response: " + NTAG424Crypto::bytesToHexString(encResponse, 32));
     
     // Step 7: Decrypt response to get TI || RndA' || PDcap2 || PCDcap2
@@ -294,6 +322,10 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     // Extract TI (Transaction Identifier) - first 4 bytes
     uint8_t ti[4];
     memcpy(ti, decResponse, 4);
+    
+    // Store TI in result for server verification
+    memcpy(result.transactionId, ti, 4);
+    
     logDebug("Transaction ID: " + NTAG424Crypto::bytesToHexString(ti, 4));
     
     // Extract RndA' - bytes 4-19 (16 bytes)
@@ -343,6 +375,7 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     
     // Store session state for secure messaging
     authenticated = true;
+    authenticatedKeyNo = keyNo;  // Store which key was used
     commandCounter = 0;  // Reset to 0 after authentication
     memcpy(transactionId, ti, 4);
     memcpy(sessionEncKey, result.sessionEncKey, 16);
@@ -355,6 +388,191 @@ bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, Aut
     
     result.success = true;
     logToWeb("✅ NTAG424 authenticatie succesvol", "success");
+    
+    return true;
+}
+
+/**
+ * Authenticate with NTAG424 DNA using EV2 First with external RndA
+ * This version accepts an external RndA (e.g., from server challenge)
+ * and returns encrypted RndB and TI for server verification
+ */
+bool NTAG424Handler::authenticateEV2First(uint8_t keyNo, const uint8_t* key, const uint8_t* externalRndA, AuthResult& result) {
+    result.success = false;
+    result.errorMessage = "";
+    
+    logDebug("Start EV2 First Authentication (with external RndA)");
+    logDebug("Key Number: " + String(keyNo));
+    logDebug("External RndA: " + NTAG424Crypto::bytesToHexString(externalRndA, 16));
+    
+    // Step 1: Send AuthenticateEV2First command
+    uint8_t cmd[3];
+    cmd[0] = CMD_AUTHENTICATE_EV2_FIRST;
+    cmd[1] = keyNo;
+    cmd[2] = 0x00;
+    
+    uint8_t response[64];
+    size_t responseLen = sizeof(response);
+    
+    if (!sendCommand(cmd, 3, response, responseLen)) {
+        result.errorMessage = "Failed to send auth command";
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    if (responseLen < 16) {
+        result.errorMessage = "Invalid auth response length: " + String(responseLen);
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    // Extract and store encrypted RndB
+    uint8_t encRndB[16];
+    memcpy(encRndB, response, 16);
+    memcpy(result.encryptedRndB, encRndB, 16);
+    
+    logDebug("Encrypted RndB: " + NTAG424Crypto::bytesToHexString(encRndB, 16));
+    
+    // Step 2: Decrypt RndB
+    uint8_t rndB[16];
+    uint8_t zeroIV[16] = {0};
+    
+    if (!NTAG424Crypto::aesDecrypt(key, zeroIV, encRndB, 16, rndB)) {
+        result.errorMessage = "Failed to decrypt RndB";
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    logDebug("Decrypted RndB: " + NTAG424Crypto::bytesToHexString(rndB, 16));
+    
+    // Step 3: Use external RndA instead of generating
+    uint8_t rndA[16];
+    memcpy(rndA, externalRndA, 16);
+    memcpy(result.rndA, rndA, 16);
+    
+    // Step 4: Rotate RndB left by 1 byte (RndB')
+    uint8_t rndBPrime[16];
+    NTAG424Crypto::rotateLeft(rndB, rndBPrime, 16);
+    
+    logDebug("Rotated RndB': " + NTAG424Crypto::bytesToHexString(rndBPrime, 16));
+    
+    // Step 5: Concatenate RndA || RndB' and encrypt
+    uint8_t authData[32];
+    memcpy(authData, rndA, 16);
+    memcpy(authData + 16, rndBPrime, 16);
+    
+    logDebug("Auth Data (RndA || RndB'): " + NTAG424Crypto::bytesToHexString(authData, 32));
+    
+    uint8_t encAuthData[32];
+    if (!NTAG424Crypto::aesEncrypt(key, zeroIV, authData, 32, encAuthData)) {
+        result.errorMessage = "Failed to encrypt auth data";
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    logDebug("Encrypted Auth Data: " + NTAG424Crypto::bytesToHexString(encAuthData, 32));
+    
+    // Step 6: Send encrypted (RndA || RndB') to card
+    uint8_t cmd2[33];
+    cmd2[0] = STATUS_ADDITIONAL_FRAME;
+    memcpy(cmd2 + 1, encAuthData, 32);
+    
+    responseLen = sizeof(response);
+    if (!sendCommand(cmd2, 33, response, responseLen)) {
+        result.errorMessage = "Failed to send auth response";
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    if (responseLen < 32) {
+        result.errorMessage = "Invalid final auth response length: " + String(responseLen);
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    // Extract encrypted response
+    uint8_t encResponse[32];
+    memcpy(encResponse, response, 32);
+    
+    // Store encrypted response in result for server verification
+    memcpy(result.encryptedResponse, encResponse, 32);
+    
+    logDebug("Encrypted Response: " + NTAG424Crypto::bytesToHexString(encResponse, 32));
+    
+    // Step 7: Decrypt response
+    uint8_t decResponse[32];
+    if (!NTAG424Crypto::aesDecrypt(key, zeroIV, encResponse, 32, decResponse)) {
+        result.errorMessage = "Failed to decrypt final response";
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    logDebug("Decrypted Response: " + NTAG424Crypto::bytesToHexString(decResponse, 32));
+    
+    // Extract and store TI
+    uint8_t ti[4];
+    memcpy(ti, decResponse, 4);
+    memcpy(result.transactionId, ti, 4);
+    
+    logDebug("Transaction ID: " + NTAG424Crypto::bytesToHexString(ti, 4));
+    
+    // Extract RndA'
+    uint8_t rndAPrime[16];
+    memcpy(rndAPrime, decResponse + 4, 16);
+    
+    logDebug("Decrypted RndA': " + NTAG424Crypto::bytesToHexString(rndAPrime, 16));
+    
+    // Extract PDcap2 and PCDcap2
+    uint8_t pdcap2[6];
+    memcpy(pdcap2, decResponse + 20, 6);
+    logDebug("PDcap2: " + NTAG424Crypto::bytesToHexString(pdcap2, 6));
+    
+    uint8_t pcdcap2[6];
+    memcpy(pcdcap2, decResponse + 26, 6);
+    logDebug("PCDcap2: " + NTAG424Crypto::bytesToHexString(pcdcap2, 6));
+    
+    // Verify RndA'
+    uint8_t expectedRndAPrime[16];
+    NTAG424Crypto::rotateLeft(rndA, expectedRndAPrime, 16);
+    
+    logDebug("Expected RndA': " + NTAG424Crypto::bytesToHexString(expectedRndAPrime, 16));
+    
+    if (memcmp(rndAPrime, expectedRndAPrime, 16) != 0) {
+        result.errorMessage = "Authentication failed: RndA' mismatch";
+        logError(result.errorMessage);
+        logError("Expected: " + NTAG424Crypto::bytesToHexString(expectedRndAPrime, 16));
+        logError("Received: " + NTAG424Crypto::bytesToHexString(rndAPrime, 16));
+        return false;
+    }
+    
+    logDebug("✅ RndA' verification successful!");
+    
+    // Step 8: Derive session keys
+    if (!NTAG424Crypto::deriveSessionKeys(rndA, rndB, key, 
+                                          result.sessionEncKey, 
+                                          result.sessionMacKey)) {
+        result.errorMessage = "Failed to derive session keys";
+        logError(result.errorMessage);
+        return false;
+    }
+    
+    logDebug("Session ENC Key: " + NTAG424Crypto::bytesToHexString(result.sessionEncKey, 16));
+    logDebug("Session MAC Key: " + NTAG424Crypto::bytesToHexString(result.sessionMacKey, 16));
+    
+    // Store session state
+    authenticated = true;
+    authenticatedKeyNo = keyNo;  // Store which key was used
+    commandCounter = 0;
+    memcpy(transactionId, ti, 4);
+    memcpy(sessionEncKey, result.sessionEncKey, 16);
+    memcpy(sessionMacKey, result.sessionMacKey, 16);
+    
+    // Initialize Current IV
+    memcpy(this->currentIV, encResponse + 16, 16);
+    logDebug("Current IV initialized: " + NTAG424Crypto::bytesToHexString(this->currentIV, 16));
+    
+    result.success = true;
+    logToWeb("✅ NTAG424 authenticatie succesvol (externe RndA)", "success");
     
     return true;
 }
@@ -382,11 +600,8 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     
     uint8_t plainData[32];
     
-    // Determine which authenticated key we're using
-    // In authenticateEV2First we authenticate with keyNo, so authKeyNo = keyNo
-    uint8_t authKeyNo = keyNo;
-    
-    if (keyNo != authKeyNo) {
+    // Determine Case 1 or Case 2 by comparing keyNo to authenticatedKeyNo
+    if (keyNo != authenticatedKeyNo) {
         // **CASE 1** (AN12196 Table 26): Different key - use XOR + CRC32
         logDebug("ChangeKey Case 1 (AN12196 §6.16.1): KeyNo != AuthKey");
         
@@ -492,6 +707,72 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     memcpy(cmd + 2, encKeyData, 32);
     memcpy(cmd + 34, mac, 8);
     
+#if DEBUG_WRITE_MODE
+    // ═══════════════════════════════════════════════════════════════
+    // DEBUG MODE: Show all data but DON'T write to card
+    // ═══════════════════════════════════════════════════════════════
+    Serial.println(F("\n╔══════════════════════════════════════════════════════════════╗"));
+    Serial.println(F("║          🔍 DEBUG WRITE MODE - NOT WRITING TO CARD 🔍       ║"));
+    Serial.println(F("╚══════════════════════════════════════════════════════════════╝"));
+    
+    Serial.println(F("\n[CHANGEKEY APDU DETAILS]"));
+    Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    Serial.print(F("Full APDU (42 bytes): "));
+    Serial.println(NTAG424Crypto::bytesToHexString(cmd, 42));
+    Serial.println();
+    Serial.print(F("  [00] Command:       0x"));
+    Serial.println(cmd[0], HEX);
+    Serial.print(F("  [01] KeyNo:         0x"));
+    Serial.println(cmd[1], HEX);
+    Serial.print(F("  [02-33] Encrypted:  "));
+    Serial.println(NTAG424Crypto::bytesToHexString(cmd + 2, 32));
+    Serial.print(F("  [34-41] MAC:        "));
+    Serial.println(NTAG424Crypto::bytesToHexString(cmd + 34, 8));
+    
+    Serial.println(F("\n[SESSION STATE]"));
+    Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    Serial.print(F("SesAuthENCKey: "));
+    Serial.println(NTAG424Crypto::bytesToHexString(sessionEncKey, 16));
+    Serial.print(F("SesAuthMACKey: "));
+    Serial.println(NTAG424Crypto::bytesToHexString(sessionMacKey, 16));
+    Serial.print(F("Transaction ID: "));
+    Serial.println(NTAG424Crypto::bytesToHexString(transactionId, 4));
+    Serial.print(F("Cmd Counter:    "));
+    Serial.println(commandCounter);
+    Serial.print(F("Current IV:     "));
+    Serial.println(NTAG424Crypto::bytesToHexString(currentIV, 16));
+    
+    Serial.println(F("\n[CRYPTO VERIFICATION]"));
+    Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    Serial.print(F("Plain Data (32 bytes): "));
+    Serial.println(NTAG424Crypto::bytesToHexString(plainData, 32));
+    Serial.print(F("IV Used:               "));
+    Serial.println(NTAG424Crypto::bytesToHexString(iv, 16));
+    Serial.print(F("Encrypted Result:      "));
+    Serial.println(NTAG424Crypto::bytesToHexString(encKeyData, 32));
+    Serial.print(F("MAC Input (40 bytes):  "));
+    Serial.println(NTAG424Crypto::bytesToHexString(macInput, 40));
+    Serial.print(F("CMAC Full (16 bytes):  "));
+    Serial.println(NTAG424Crypto::bytesToHexString(macFull, 16));
+    Serial.print(F("CMAC (8 bytes):        "));
+    Serial.println(NTAG424Crypto::bytesToHexString(mac, 8));
+    
+    Serial.println(F("\n╔══════════════════════════════════════════════════════════════╗"));
+    Serial.println(F("║   ⚠️  CARD NOT WRITTEN - VERIFY CRYPTO FIRST  ⚠️            ║"));
+    Serial.println(F("╚══════════════════════════════════════════════════════════════╝"));
+    Serial.println();
+    
+    // Simulate success (increment counter, update IV as if command succeeded)
+    commandCounter++;
+    memcpy(this->currentIV, encKeyData + 16, 16);
+    
+    logToWeb("🔍 DEBUG: ChangeKey voorbereid maar NIET geschreven naar kaart", "warning");
+    return true;  // Simulate success
+    
+#else
+    // ═══════════════════════════════════════════════════════════════
+    // NORMAL MODE: Actually write to card
+    // ═══════════════════════════════════════════════════════════════
     uint8_t response[32];
     size_t responseLen = sizeof(response);
     
@@ -500,6 +781,7 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
         authenticated = false;  // Authentication lost on error
         return false;
     }
+#endif
     
     // Increment command counter after successful command
     commandCounter++;
@@ -578,6 +860,102 @@ bool NTAG424Handler::getVersion(uint8_t* versionInfo) {
     }
     
     return true;
+}
+
+// Commit transaction (makes ChangeKey permanent)
+bool NTAG424Handler::commitTransaction() {
+    if (!authenticated) {
+        logError("Not authenticated - cannot commit transaction");
+        return false;
+    }
+    
+    logDebug("═══════════════════════════════════════");
+    logDebug("CommitTransaction");
+    logDebug("═══════════════════════════════════════");
+    
+    // CommitTransaction command: 0xC7 (no parameters)
+    // In secure messaging (EV2):
+    // C-APDU: 90 C7 00 00 08 [MAC:8] 00
+    
+    uint8_t cmd[14];
+    cmd[0] = 0x90;  // CLA
+    cmd[1] = 0xC7;  // INS: CommitTransaction
+    cmd[2] = 0x00;  // P1
+    cmd[3] = 0x00;  // P2
+    cmd[4] = 0x08;  // Lc: 8 bytes (MAC)
+    // cmd[5..12] = MAC (filled below)
+    cmd[13] = 0x00;  // Le
+    
+    // Calculate IV for MAC calculation
+    // IV = E(SesAuthENCKey, A55A || TI || CmdCtr || 0000000000000000)
+    uint8_t ivInput[16];
+    ivInput[0] = 0xA5;
+    ivInput[1] = 0x5A;
+    memcpy(ivInput + 2, transactionId, 4);
+    ivInput[6] = commandCounter & 0xFF;
+    ivInput[7] = (commandCounter >> 8) & 0xFF;
+    memset(ivInput + 8, 0x00, 8);
+    
+    uint8_t iv[16];
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, currentIV, ivInput, 16, iv)) {
+        logError("Failed to calculate IV");
+        return false;
+    }
+    
+    logDebug("IV: " + NTAG424Crypto::bytesToHexString(iv, 16));
+    
+    // Calculate CMAC over: CmdHeader || CmdCtr || TI
+    uint8_t macInput[8];
+    macInput[0] = 0xC7;  // Command
+    macInput[1] = commandCounter & 0xFF;
+    macInput[2] = (commandCounter >> 8) & 0xFF;
+    memcpy(macInput + 3, transactionId, 4);
+    macInput[7] = 0x00;  // No data for this command
+    
+    logDebug("MAC Input: " + NTAG424Crypto::bytesToHexString(macInput, 8));
+    
+    // Calculate 8-byte truncated CMAC
+    uint8_t mac[8];
+    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 8, mac)) {
+        logError("Failed to calculate CMAC");
+        return false;
+    }
+    
+    logDebug("CMAC: " + NTAG424Crypto::bytesToHexString(mac, 8));
+    
+    // Fill MAC into command
+    memcpy(cmd + 5, mac, 8);
+    
+    logDebug("Command: " + NTAG424Crypto::bytesToHexString(cmd, 14));
+    
+#if DEBUG_WRITE_MODE
+    Serial.println(F("\n╔══════════════════════════════════════════════════════════════╗"));
+    Serial.println(F("║   🔍 DEBUG MODE: CommitTransaction NOT SENT  🔍            ║"));
+    Serial.println(F("╚══════════════════════════════════════════════════════════════╝"));
+    
+    // Simulate success
+    commandCounter++;
+    
+    logToWeb("🔍 DEBUG: CommitTransaction voorbereid maar NIET gestuurd", "warning");
+    return true;
+#else
+    // Send command
+    uint8_t response[32];
+    size_t responseLen = sizeof(response);
+    
+    if (!sendCommand(cmd, 14, response, responseLen)) {
+        logError("CommitTransaction command failed");
+        authenticated = false;
+        return false;
+    }
+    
+    // Increment counter
+    commandCounter++;
+    logDebug("CmdCtr incremented to: " + String(commandCounter));
+    
+    logToWeb("✅ Transaction committed", "success");
+    return true;
+#endif
 }
 
 // Select application
@@ -902,6 +1280,242 @@ bool NTAG424Handler::transceiveRaw(const uint8_t* cmd, size_t cmdLen,
     // The difference is semantic: transceiveRaw() is for standard ISO7816 commands
     // while transceive() is for wrapped native NTAG424 commands
     return transceive(cmd, cmdLen, response, responseLen);
+}
+
+// Change Key Settings (authenticated command)
+// AN12196 Section 6.17: ChangeKeySettings command
+bool NTAG424Handler::changeKeySettings(uint8_t settings) {
+    if (!authenticated) {
+        logError("ChangeKeySettings requires authentication");
+        return false;
+    }
+    
+    logDebug("ChangeKeySettings called with: 0x" + String(settings, HEX));
+    logToWeb("Start ChangeKeySettings met waarde 0x" + String(settings, HEX), "info");
+    
+    // Step 1: Prepare plaintext data (16 bytes)
+    // Format: [KeySettings:1] [CRC32:4] [Padding:11]
+    uint8_t plainData[16];
+    plainData[0] = settings;
+    
+    // Calculate CRC32 over the KeySettings byte (LSB first as per ISO14443)
+    uint32_t crc = NTAG424Crypto::calculateCRC32(&settings, 1);
+    logDebug("CRC32: " + String(crc, HEX));
+    
+    // Pack CRC32 in LSB first order
+    plainData[1] = crc & 0xFF;
+    plainData[2] = (crc >> 8) & 0xFF;
+    plainData[3] = (crc >> 16) & 0xFF;
+    plainData[4] = (crc >> 24) & 0xFF;
+    
+    // Add padding (0x80 followed by zeros)
+    plainData[5] = 0x80;
+    memset(plainData + 6, 0x00, 10);
+    
+    logDebug("Plain Data: " + NTAG424Crypto::bytesToHexString(plainData, 16));
+    
+    // Step 2: Calculate IV for encryption (AN12196 Section 9.1.4)
+    // IV = E(SesAuthENCKey, A55A || TI || CmdCtr || 0000000000000000)
+    uint8_t ivInput[16];
+    ivInput[0] = 0xA5;
+    ivInput[1] = 0x5A;
+    memcpy(ivInput + 2, transactionId, 4);
+    ivInput[6] = commandCounter & 0xFF;        // CmdCtr LSB first
+    ivInput[7] = (commandCounter >> 8) & 0xFF;
+    memset(ivInput + 8, 0x00, 8);  // Zero padding
+    
+    uint8_t iv[16];
+    // EV2: Use current IV for chaining
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, currentIV, ivInput, 16, iv)) {
+        logError("Failed to calculate IV");
+        return false;
+    }
+    
+    logDebug("IV: " + NTAG424Crypto::bytesToHexString(iv, 16));
+    logDebug("CmdCtr: " + String(commandCounter));
+    
+    // Step 3: Encrypt plaintext data with calculated IV
+    uint8_t encData[16];
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, iv, plainData, 16, encData)) {
+        logError("Failed to encrypt key settings");
+        return false;
+    }
+    
+    logDebug("Encrypted Data: " + NTAG424Crypto::bytesToHexString(encData, 16));
+    
+    // Step 4: Calculate CMAC (AN12196 Section 9.1.9)
+    // MAC Input = Cmd || CmdCtr || TI || EncCmdData
+    // Total: 1 + 2 + 4 + 16 = 23 bytes
+    uint8_t macInput[23];
+    macInput[0] = CMD_CHANGE_KEY_SETTINGS;       // Cmd (1 byte)
+    macInput[1] = commandCounter & 0xFF;         // CmdCtr LSB first (2 bytes)
+    macInput[2] = (commandCounter >> 8) & 0xFF;
+    memcpy(macInput + 3, transactionId, 4);      // TI (4 bytes, MSB first)
+    memcpy(macInput + 7, encData, 16);           // EncCmdData (16 bytes)
+    
+    logDebug("MAC Input: " + NTAG424Crypto::bytesToHexString(macInput, 23));
+    
+    // Calculate full CMAC for debugging
+    uint8_t macFull[16];
+    if (!NTAG424Crypto::calculateCMACFull(sessionMacKey, macInput, 23, macFull)) {
+        logError("Failed to calculate full CMAC");
+        return false;
+    }
+    logDebug("CMAC Full: " + NTAG424Crypto::bytesToHexString(macFull, 16));
+    
+    // Truncate to 8 bytes
+    uint8_t mac[8];
+    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 23, mac)) {
+        logError("Failed to calculate CMAC");
+        return false;
+    }
+    
+    logDebug("CMAC: " + NTAG424Crypto::bytesToHexString(mac, 8));
+    
+    // Step 5: Build command
+    // Format: [Cmd:1] [EncData:16] [MAC:8] = 25 bytes
+    uint8_t cmd[25];
+    cmd[0] = CMD_CHANGE_KEY_SETTINGS;
+    memcpy(cmd + 1, encData, 16);
+    memcpy(cmd + 17, mac, 8);
+    
+    Serial.println(F("\n[CHANGE KEY SETTINGS]"));
+    Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    Serial.print(F("Settings:       0x"));
+    Serial.println(settings, HEX);
+    Serial.print(F("Full APDU:      "));
+    Serial.println(NTAG424Crypto::bytesToHexString(cmd, 25));
+    Serial.print(F("  [00] Cmd:     0x"));
+    Serial.println(cmd[0], HEX);
+    Serial.print(F("  [01-16] Enc:  "));
+    Serial.println(NTAG424Crypto::bytesToHexString(cmd + 1, 16));
+    Serial.print(F("  [17-24] MAC:  "));
+    Serial.println(NTAG424Crypto::bytesToHexString(cmd + 17, 8));
+    Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    
+    // Step 6: Send command to card
+    uint8_t response[32];
+    size_t responseLen = sizeof(response);
+    
+    if (!sendCommand(cmd, 25, response, responseLen)) {
+        logError("ChangeKeySettings command failed");
+        authenticated = false;  // Authentication lost on error
+        return false;
+    }
+    
+    // Step 7: Update session state after successful command
+    commandCounter++;
+    logDebug("CmdCtr incremented to: " + String(commandCounter));
+    
+    // Update Current IV for next operation (EV2 chained CBC mode)
+    // Use last ciphertext block (all 16 bytes since we only have one block)
+    memcpy(this->currentIV, encData, 16);
+    logDebug("Current IV updated: " + NTAG424Crypto::bytesToHexString(this->currentIV, 16));
+    
+    logToWeb("✅ Key settings succesvol gewijzigd!", "success");
+    
+    return true;
+}
+
+// Get Key Settings (authenticated command)
+// AN12196 Section 6.7: GetKeySettings command
+bool NTAG424Handler::getKeySettings(uint8_t& settings, uint8_t& maxKeys) {
+    if (!authenticated) {
+        logError("GetKeySettings requires authentication");
+        return false;
+    }
+    
+    logDebug("Getting key settings...");
+    
+    // GetKeySettings command (0x45) - no parameters
+    uint8_t cmd[1] = { CMD_GET_KEY_SETTINGS };
+    
+    uint8_t response[32];
+    size_t responseLen = sizeof(response);
+    
+    if (!sendCommand(cmd, 1, response, responseLen)) {
+        logError("GetKeySettings command failed");
+        return false;
+    }
+    
+    // Response format (authenticated response, needs decryption):
+    // - Encrypted: [KeySettings:1] [MaxKeys:1] [Padding:14] (16 bytes encrypted + 8 byte MAC)
+    // OR
+    // - Plain (if no auth): [KeySettings:1] [MaxKeys:1]
+    
+    if (responseLen >= 2) {
+        // For now, assume plain response for factory cards
+        // TODO: Implement encrypted response decryption for authenticated sessions
+        settings = response[0];
+        maxKeys = response[1];
+        
+        logDebug("Key Settings: 0x" + String(settings, HEX));
+        logDebug("Max Keys: " + String(maxKeys));
+        
+        // Decode KeySettings byte (AN12196 Table 20):
+        // Bit 7: Configuration changeable (1 = allowed)
+        // Bit 6: AuthKey changeable without master key auth
+        // Bit 5: Free Directory List access
+        // Bit 4: Free Create/Delete wo master key
+        // Bit 3: Configuration frozen (1 = frozen, cannot change)
+        // Bits 2-0: ChangeKey access rights (key number or 0xE=frozen)
+        
+        Serial.println(F("\n[KEY SETTINGS ANALYSIS]"));
+        Serial.println(F("────────────────────────────────────────────────────────────"));
+        
+        bool configChangeable = (settings & 0x80) != 0;
+        bool authKeyChangeable = (settings & 0x40) != 0;
+        bool freeDirList = (settings & 0x20) != 0;
+        bool freeCreateDelete = (settings & 0x10) != 0;
+        bool configFrozen = (settings & 0x08) != 0;
+        uint8_t changeKeyRights = settings & 0x0F;
+        
+        Serial.print(F("Configuration changeable:  "));
+        Serial.println(configChangeable ? "✅ YES" : "❌ NO (frozen)");
+        
+        Serial.print(F("AuthKey changeable:        "));
+        Serial.println(authKeyChangeable ? "✅ YES (without master)" : "⚠️  Needs master key");
+        
+        Serial.print(F("Free Directory List:       "));
+        Serial.println(freeDirList ? "✅ YES" : "❌ NO");
+        
+        Serial.print(F("Free Create/Delete:        "));
+        Serial.println(freeCreateDelete ? "✅ YES" : "❌ NO");
+        
+        Serial.print(F("Configuration frozen:      "));
+        Serial.println(configFrozen ? "❌ YES (LOCKED!)" : "✅ NO");
+        
+        Serial.print(F("ChangeKey rights:          "));
+        if (changeKeyRights == 0x0E) {
+            Serial.println(F("🔒 FROZEN (ChangeKey disabled!)"));
+        } else if (changeKeyRights == 0x0F) {
+            Serial.println(F("🆓 FREE (no auth needed)"));
+        } else {
+            Serial.print(F("Key #"));
+            Serial.print(changeKeyRights);
+            Serial.println(F(" required"));
+        }
+        
+        Serial.print(F("Maximum keys:              "));
+        Serial.println(maxKeys);
+        Serial.println(F("────────────────────────────────────────────────────────────"));
+        
+        // Check if ChangeKey is possible
+        if (changeKeyRights == 0x0E || configFrozen) {
+            Serial.println(F(""));
+            Serial.println(F("⚠️  WARNING: ChangeKey may be BLOCKED!"));
+            Serial.println(F("   This card may not allow key changes."));
+            Serial.println(F("   Proceeding anyway - card will reject if locked."));
+            Serial.println(F(""));
+        } else {
+            Serial.println(F("\n✅ ChangeKey should be allowed\n"));
+        }
+        
+        return true;
+    } else {
+        logError("Invalid GetKeySettings response length: " + String(responseLen));
+        return false;
+    }
 }
 
 // Logging helpers

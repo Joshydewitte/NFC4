@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""
+Test of de kaart nog factory keys heeft
+"""
+
+print("="*80)
+print("KAART STATUS TEST")
+print("="*80)
+
+print("\n[HYPOTHESE]")
+print("-" * 80)
+print("Als authenticatie faalt met afgeleide key 24D086AA673E88BFADA9FEB3DBF5B83A,")
+print("maar ChangeKey gaf SW=9100 (success)...")
+print("\nDan is er één van deze opties:")
+print("  1. ChangeKey werkte niet echt (bug in CMAC/encryption)")
+print("  2. Kaart heeft nog steeds factory keys (00...00)")
+print("  3. Kaart heeft een ANDERE key (onbekend)")
+
+print("\n" + "="*80)
+print("TEST PROCEDURE")
+print("="*80)
+
+print("\n[STAP 1: Test Factory Key]")
+print("-" * 80)
+print("Web Interface Settings:")
+print("  ☑️  Factory Card:     AAN (checked)  ✅")
+print("  ☐  Direct Key Mode:  UIT")
+print("  📝 Previous Key:     (leeg)")
+print("  📝 Master Secret:    A54C788525178060913D4CFC06380D1B")
+print("\nStart schrijven en kijk of authenticatie SLAAGT met factory key (00...00)")
+print("\nVerwacht resultaat:")
+print("  - Als auth SLAAGT → Kaart heeft nog factory keys")
+print("  - Als auth FAALT → Kaart heeft andere keys")
+
+print("\n[STAP 2: Als Factory Key Werkt]")
+print("-" * 80)
+print("Dan was het probleem in Test 1:")
+print("  ❌ ChangeKey crypto was verkeerd")
+print("  ❌ CMAC of encryption had een bug")
+print("  ✅ Kaart geeft SW=9100 ook al is de command fout")
+print("\nWe moeten dan de ChangeKey crypto fixen!")
+
+print("\n[STAP 3: Als Factory Key NIET Werkt]")
+print("-" * 80)
+print("Dan heeft de kaart een ONBEKENDE key.")
+print("Mogelijke oorzaken:")
+print("  - Kaart is door iets anders al gepersonaliseerd")
+print("  - Kaart is corrupt")
+print("  - Er is iets mis met RF communicatie")
+
+print("\n" + "="*80)
+print("ALTERNATIEVE TEST: DIRECT KEY MODE")
+print("="*80)
+print("\nTest of kaart de NIEUWE key heeft (die we probeerde te schrijven):")
+print("\nWeb Interface Settings:")
+print("  ☐  Factory Card:     UIT")
+print("  ☑️  Direct Key Mode:  AAN (checked)  ✅")
+print("  📝 Previous Key:     CDF172D3C9F8328B93A40E94D3C6A8F8")
+print("                       (de nieuwe key uit test 1)")
+print("  📝 Master Secret:    A54C788525178060913D4CFC06380D1B")
+print("                       (om terug te schrijven)")
+print("\nAls dit SLAAGT → ChangeKey werkte WEL, maar je probeerde met verkeerde key")
+print("Als dit FAALT  → ChangeKey werkte NIET")
+
+print("\n" + "="*80)

@@ -10,6 +10,7 @@ SystemConfig::SystemConfig()
       writeMode("single"),
       writeActive(false),
       writeIsFactory(true),
+      writeIsDirectKey(false),  // Default: previous key is master secret
       keySource("esp32") {  // Default to ESP32 mode
     startTime = millis();
 }
@@ -240,6 +241,16 @@ void SystemConfig::setIsFactory(bool factory) {
 
 bool SystemConfig::getIsFactory() {
     return writeIsFactory;
+}
+
+void SystemConfig::setIsDirectKey(bool direct) {
+    writeIsDirectKey = direct;
+    Serial.print(F("Direct key mode: "));
+    Serial.println(direct ? "ja (previous key is een afgeleide AES key)" : "nee (previous key is master secret)");
+}
+
+bool SystemConfig::getIsDirectKey() {
+    return writeIsDirectKey;
 }
 
 void SystemConfig::setKeySource(const String& source) {

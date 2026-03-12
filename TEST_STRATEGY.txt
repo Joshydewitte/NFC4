@@ -1,0 +1,35 @@
+TEST STRATEGIE - LOGISCHE AANPAK
+
+FEIT: Alle afgeleide keys geven SW=91AE in authentication stap 2
+
+MOGELIJKE VERKLARINGEN:
+
+1. KAARTEN ZIJN NOG FACTORY
+   - Test: Authenticeer met 00000000000000000000000000000000
+   - Factory Card checkbox: AAN
+   - Als dit WERKT: kaarten zijn nooit geschreven, "success" was misleading
+   
+2. ANDER MASTER SECRET GEBRUIKT
+   - Misschien was er een test/debug master secret actief?
+   - Misschien een default secret in de code?
+   - Check: Was er ooit een andere master secret in gebruik?
+
+3. KEY DERIVATIE WAS COMPLEET ANDERS
+   - Oude firmware gebruikte misschien geen HMAC-SHA256?
+   - Misschien gewoon eerste 16 bytes van SHA256(master + uid)?
+   - Of een simpele XOR/concatenate?
+
+4. KAARTEN ZIJN BESCHADIGD/GEBLOKKEERD
+   - Te veel failed authentication attempts
+   - Kaarten in verkeerde security state
+   - Test: Probeer GetVersion command
+
+5. AUTHENTICATION PROTOCOL IS FOUT
+   - Onze AES encrypt/decrypt heeft een bug
+   - IV is verkeerd (maar we gebruiken zero IV zoals AN12196 zegt)
+   - Rotation richting is verkeerd
+
+ACTIE: 
+1. Test met Factory Key first (simpelste test)
+2. Check of er ooit een ander master secret in gebruik was
+3. Zoek naar oude code die laat zien HOE key derivation werd gedaan
