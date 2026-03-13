@@ -587,6 +587,7 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
               char h[3] = {scanResult.nextChallenge[i*2], scanResult.nextChallenge[i*2+1], 0};
               cachedChallenge[i] = (uint8_t)strtol(h, NULL, 16);
             }
+            hasCachedChallenge = true;
             Serial.println(F("   ✅ Next nonce cached"));
           } else {
             // Server didn't return a next nonce - request fresh one next scan
@@ -672,11 +673,23 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
   // ═══════════════════════════════════════════════════════════════
   if (!cryptoProofSent && serverClient.isServerOnline()) {
     Serial.println(F("\n📤 Sending simple scan to server..."));
-    bool sent = serverClient.sendScan(cardInfo.uidString, cardStatus, cardInfo.cardType);
-    if (sent) {
+    ServerClient::ScanResult sendResult = serverClient.sendScan(cardInfo.uidString, cardStatus, cardInfo.cardType);
+    if (sendResult.success) {
       webServer.broadcastLog("✅ Scan verzonden naar server", "success");
+      // Cache fresh nonce if server issued one (happens on challenge_failed)
+      if (sendResult.nextChallenge.length() == 32) {
+        for (int i = 0; i < 16; i++) {
+          char h[3] = {sendResult.nextChallenge[i*2], sendResult.nextChallenge[i*2+1], 0};
+          cachedChallenge[i] = (uint8_t)strtol(h, NULL, 16);
+        }
+        hasCachedChallenge = true;
+        Serial.println(F("   🔄 Fresh nonce cached after challenge_failed"));
+      } else {
+        // No nonce returned (non-challenge_failed status) — keep existing cache
+      }
     } else {
       webServer.broadcastLog("⚠️ Scan verzenden mislukt", "warning");
+      hasCachedChallenge = false; // force fresh fetch on next scan
     }
   } else if (!cryptoProofSent) {
     Serial.println(F("⚠️  Server offline - scan not logged"));

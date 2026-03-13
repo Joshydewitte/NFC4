@@ -314,8 +314,23 @@ public:
         } else {
             Serial.print(F("❌ Scan request failed: HTTP "));
             Serial.println(httpCode);
-            result.status = "error";
-            result.message = "HTTP " + String(httpCode);
+            // Try to parse body anyway — server may have sent a fresh nonce
+            String responseStr = http.getString();
+            String httpErr = "HTTP ";
+            httpErr += httpCode;
+            StaticJsonDocument<512> responseDoc;
+            if (!deserializeJson(responseDoc, responseStr)) {
+                result.status = responseDoc["status"] | "error";
+                const char* msg = responseDoc["message"];
+                result.message = msg ? String(msg) : httpErr;
+                result.nextChallenge = responseDoc["nextChallenge"] | "";
+                if (result.nextChallenge.length() == 32) {
+                    Serial.println(F("   🔄 Fresh nonce received in error response"));
+                }
+            } else {
+                result.status = "error";
+                result.message = httpErr;
+            }
             logToWeb("❌ Scan request mislukt: HTTP " + String(httpCode), "error");
         }
         
@@ -609,10 +624,14 @@ public:
     
     // ============ CARD SCAN LOGGING ============
     
-    bool sendScan(const String& cardUID, const String& cardStatus, const String& cardType = "") {
+    ScanResult sendScan(const String& cardUID, const String& cardStatus, const String& cardType = "") {
+        ScanResult result;
+        result.success = false;
+        result.credits = 0;
         if (serverUrl.isEmpty()) {
             Serial.println(F("No server configured - scan not logged"));
-            return false;
+            result.status = "error";
+            return result;
         }
         
         // Determine status from cardType and cardStatus
@@ -644,10 +663,11 @@ public:
         }
         
         // Server API: POST /api/scan
-        // Expected: { uid, readerName, isPersonalized, status, cardType }
+        // Expected: { uid, readerId, readerName, isPersonalized, status, cardType }
         StaticJsonDocument<512> requestDoc;
         requestDoc["uid"] = cardUID;
-        requestDoc["readerName"] = WiFi.macAddress(); // Use MAC as reader identifier
+        requestDoc["readerId"]   = WiFi.macAddress();
+        requestDoc["readerName"] = WiFi.macAddress();
         requestDoc["isPersonalized"] = isPersonalized;
         requestDoc["status"] = scanStatus;
         if (cardType.length() > 0) {
@@ -670,21 +690,28 @@ public:
         http.setTimeout(5000);
         
         int httpCode = http.POST(requestBody);
-        bool success = false;
         
         if (httpCode == 200) {
-            String response = http.getString();
+            String responseStr = http.getString();
             Serial.println(F("✅ Scan logged to server"));
-            Serial.print(F("   Response: "));
-            Serial.println(response);
-            success = true;
+            StaticJsonDocument<512> responseDoc;
+            if (!deserializeJson(responseDoc, responseStr)) {
+                result.success = true;
+                result.status = responseDoc["status"] | "";
+                result.nextChallenge = responseDoc["nextChallenge"] | "";
+                if (result.nextChallenge.length() == 32) {
+                    Serial.println(F("   🔄 Fresh nonce received after challenge_failed"));
+                }
+            } else {
+                result.success = true; // HTTP 200 is a success even if JSON parse fails
+            }
         } else {
             Serial.print(F("❌ Scan logging failed: HTTP "));
             Serial.println(httpCode);
         }
         
         http.end();
-        return success;
+        return result;
     }
 };
 
