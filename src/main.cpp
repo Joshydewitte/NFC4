@@ -576,35 +576,45 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
             webServer.broadcastLog("✅ " + scanResult.message, "success");
             if (scanResult.credits > 0) webServer.broadcastLog("💰 Credits: " + String(scanResult.credits), "success");
             cryptoProofSent = true;
-
-            // Cache next nonce for next card scan
-            if (scanResult.nextChallenge.length() == 32) {
-              for (int i = 0; i < 16; i++) {
-                char h[3] = {scanResult.nextChallenge[i*2], scanResult.nextChallenge[i*2+1], 0};
-                cachedChallenge[i] = (uint8_t)strtol(h, NULL, 16);
-              }
-              Serial.println(F("   ✅ Next nonce cached"));
-            } else {
-              // Server didn't return a next nonce - invalidate cache so next
-              // scan requests a fresh one instead of reusing a spent nonce
-              hasCachedChallenge = false;
-              Serial.println(F("   ⚠️ No next nonce in response - will request fresh nonce next scan"));
-            }
           } else {
-            Serial.println(F("   ❌ Server verification failed"));
+            webServer.broadcastLog("⚠️ " + scanResult.message, "warning");
+            cryptoProofSent = true; // proof was sent, skip simple scan
+          }
+
+          // Always cache next nonce — server marks current nonce as used regardless of result
+          if (scanResult.nextChallenge.length() == 32) {
+            for (int i = 0; i < 16; i++) {
+              char h[3] = {scanResult.nextChallenge[i*2], scanResult.nextChallenge[i*2+1], 0};
+              cachedChallenge[i] = (uint8_t)strtol(h, NULL, 16);
+            }
+            Serial.println(F("   ✅ Next nonce cached"));
+          } else {
+            // Server didn't return a next nonce - request fresh one next scan
+            hasCachedChallenge = false;
+            Serial.println(F("   ⚠️ No next nonce in response - will request fresh nonce next scan"));
           }
         } else {
           Serial.println(F("   ❌ Card auth failed (wrong key?)"));
         }
       }
 
-    } else if (startResult.success && !startResult.cardKnown) {
-      // Card not registered on server - nonce not consumed, keep hasCachedChallenge = true
-      // ISO-DEP already active, try factory key directly
-      Serial.println(F("   Card unknown to server - trying factory key..."));
-      {
+    } else if (startResult.success && !startResult.cardKnown && startResult.derivedKeyHex.length() == 32) {
+      // Card not registered in DB but server returned derived key
+      // Auth to check if this is a personalized (written) card
+      Serial.println(F("   Card unknown to server - checking if personalized..."));
+      for (int i = 0; i < 16; i++) {
+        char hex[3] = {startResult.derivedKeyHex[i*2], startResult.derivedKeyHex[i*2+1], 0};
+        derivedKey[i] = (uint8_t)strtol(hex, NULL, 16);
+      }
+      NTAG424Handler::AuthResult authResult;
+      if (ntag424Handler->authenticateEV2First(0, derivedKey, cachedChallenge, authResult)) {
+        cardStatus = "personalized_unregistered";
+        hasCachedChallenge = false; // nonce was consumed as RndA, force fresh fetch next scan
+        Serial.println(F("   ✅ Auth OK → PERSONALIZED but not in DB"));
+        webServer.broadcastLog("⚠️ Gepersonaliseerde kaart - niet geregistreerd in database", "warning");
+      } else {
+        // Try factory key as fallback
         uint8_t factoryKey[16] = {0};
-        NTAG424Handler::AuthResult authResult;
         if (ntag424Handler->authenticateEV2First(0, factoryKey, authResult)) {
           cardStatus = "factory";
           Serial.println(F("   ✅ Factory key works → FACTORY"));
@@ -612,7 +622,7 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
         }
       }
 
-    } else {
+    } else if (startResult.success && !startResult.cardKnown) {
       // scan/start failed - invalidate nonce, it may be stale
       hasCachedChallenge = false;
       Serial.println(F("   ❌ scan/start failed - server error"));

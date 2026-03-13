@@ -631,6 +631,9 @@ public:
             if (cardStatus == "personalized" || cardStatus == "gedoopt") {
                 isPersonalized = true;
                 scanStatus = "known";
+            } else if (cardStatus == "personalized_unregistered") {
+                isPersonalized = true;
+                scanStatus = "personalized_unregistered";
             } else if (cardStatus == "factory") {
                 isPersonalized = false;
                 scanStatus = "factory";
