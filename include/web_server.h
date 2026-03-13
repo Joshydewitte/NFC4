@@ -170,6 +170,22 @@ private:
             if (!requireAuth()) return;
             handleSaveNetworkSettings();
         });
+
+        // NDEF / URL settings API
+        httpServer.on("/api/settings/ndef", HTTP_POST, [this]() {
+            if (!requireAuth()) return;
+            handleSaveNdefSettings();
+        });
+
+        httpServer.on("/api/settings/ndef", HTTP_GET, [this]() {
+            if (!requireAuth()) return;
+            String tpl  = config->getNdefUrlTemplate();
+            bool   en   = config->isNdefEnabled();
+            String mode = config->getNdefWriteMode();
+            String json = "{\"urlTemplate\":\"" + tpl + "\",\"enabled\":" +
+                          (en ? "true" : "false") + ",\"writeMode\":\"" + mode + "\"}";
+            httpServer.send(200, "application/json", json);
+        });
         
         // System control APIs
         httpServer.on("/api/reboot", HTTP_POST, [this]() {
@@ -445,30 +461,59 @@ private:
     
     void handleSaveNetworkSettings() {
         String body = httpServer.arg("plain");
-        
+
         int modeStart = body.indexOf("\"mode\":\"") + 8;
         int modeEnd = body.indexOf("\"", modeStart);
         String mode = body.substring(modeStart, modeEnd);
-        
+
         config->setNetworkMode(mode);
-        
+
         if (mode == "static") {
             int ipStart = body.indexOf("\"ip\":\"") + 6;
             int ipEnd = body.indexOf("\"", ipStart);
             String ip = body.substring(ipStart, ipEnd);
-            
+
             int gwStart = body.indexOf("\"gateway\":\"") + 11;
             int gwEnd = body.indexOf("\"", gwStart);
             String gw = body.substring(gwStart, gwEnd);
-            
+
             int snStart = body.indexOf("\"subnet\":\"") + 10;
             int snEnd = body.indexOf("\"", snStart);
             String sn = body.substring(snStart, snEnd);
-            
+
             config->setStaticIP(ip, gw, sn);
         }
-        
+
         httpServer.send(200, "application/json", "{\"success\":true}");
+    }
+
+    void handleSaveNdefSettings() {
+        String body = httpServer.arg("plain");
+
+        // urlTemplate
+        int tplStart = body.indexOf("\"urlTemplate\":\"") + 15;
+        int tplEnd   = body.indexOf("\"", tplStart);
+        if (tplStart > 14 && tplEnd > tplStart) {
+            String tpl = body.substring(tplStart, tplEnd);
+            config->setNdefUrlTemplate(tpl);
+        }
+
+        // enabled boolean
+        bool enabled = (body.indexOf("\"enabled\":true") >= 0);
+        config->setNdefEnabled(enabled);
+
+        // writeMode: "keys_and_ndef" | "keys_only" | "ndef_only"
+        int wmStart = body.indexOf("\"writeMode\":\"") + 14;
+        int wmEnd   = body.indexOf("\"", wmStart);
+        if (wmStart > 13 && wmEnd > wmStart) {
+            String wm = body.substring(wmStart, wmEnd);
+            if (wm == "keys_and_ndef" || wm == "keys_only" || wm == "ndef_only") {
+                config->setNdefWriteMode(wm);
+            }
+        }
+
+        httpServer.send(200, "application/json", "{\"success\":true}");
+        Serial.println(F("[NDEF] Settings saved"));
     }
     
     void handleStatsAPI() {
@@ -665,6 +710,19 @@ private:
             config->setPreviousKey(previousKey);
         }
         config->setWriteMode(mode);
+
+        // Parse and store ndefMode from request body (overrides NVS default)
+        int ndefModeStart = body.indexOf("\"ndefMode\":\"") + 12;
+        int ndefModeEnd = body.indexOf("\"", ndefModeStart);
+        if (ndefModeStart > 12 && ndefModeEnd > ndefModeStart) {
+            String ndefMode = body.substring(ndefModeStart, ndefModeEnd);
+            if (ndefMode == "keys_and_ndef" || ndefMode == "keys_only" || ndefMode == "ndef_only") {
+                config->setNdefWriteMode(ndefMode);
+                Serial.print(F("✓ ndefMode: "));
+                Serial.println(ndefMode);
+            }
+        }
+
         config->setWriteActive(true);
         
         // Log for debugging

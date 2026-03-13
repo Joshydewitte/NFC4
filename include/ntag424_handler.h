@@ -136,6 +136,15 @@ public:
     bool selectNdefApplication();
     
     /**
+     * Write an NDEF URI record to the NTAG424 NDEF file (0xE104).
+     * Must be called AFTER successful authenticateEV2First() with the current key.
+     * Uses plain CommMode (default NTAG424 NDEF file access = free read, key-protected write).
+     * @param url - Full URL string (e.g. "https://example.com/nfc/a3f8c2")
+     * @return true on success
+     */
+    bool writeNDEF(const String& url);
+
+    /**
      * Select application (AID)
      * @param aid - Application ID (3 bytes)
      * @return true on success

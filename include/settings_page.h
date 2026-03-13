@@ -233,6 +233,20 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
     </div>
 
     <div class="card">
+        <h2>🌐 NDEF / URL Instellingen</h2>
+        <div class="info-box">
+            Schrijf automatisch een unieke URL naar elke kaart tijdens personalisatie.<br>
+            Gebruik <strong>{uid}</strong> voor het kaart-UID, of <strong>{id}</strong> voor een HMAC-afgeleid kort ID (10 hex tekens).
+        </div>
+        <div class="form-group">
+            <label for="ndefUrlTemplate">URL Template</label>
+            <input type="text" id="ndefUrlTemplate" placeholder="https://jouwdomein.nl/nfc/{uid}" maxlength="200">
+            <small style="color:#888;">Voorbeeld: https://example.com/card/{uid} of https://example.com/card/{id}</small>
+        </div>
+        <button onclick="saveNdefSettings()" style="margin-top: 10px;">💾 NDEF Opslaan</button>
+    </div>
+
+    <div class="card">
         <h2>Netwerk Instellingen</h2>
         <div class="radio-group">
             <label>
@@ -472,6 +486,33 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
             })
             .then(() => location.href = '/login');
         }
+
+        function loadNdefSettings() {
+            fetch('/api/settings/ndef', { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                if (data.urlTemplate !== undefined) {
+                    document.getElementById('ndefUrlTemplate').value = data.urlTemplate;
+                }
+            })
+            .catch(() => {});
+        }
+
+        function saveNdefSettings() {
+            const urlTemplate = document.getElementById('ndefUrlTemplate').value.trim();
+            fetch('/api/settings/ndef', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ urlTemplate: urlTemplate, enabled: urlTemplate.length > 0 })
+            })
+            .then(r => r.json())
+            .then(data => showMessage(data.success ? '✅ NDEF instellingen opgeslagen' : '❌ Opslaan mislukt', !data.success))
+            .catch(e => showMessage('❌ Fout: ' + e, true));
+        }
+
+        // Load NDEF settings on page load
+        loadNdefSettings();
     </script>
 </body>
 </html>

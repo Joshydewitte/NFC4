@@ -90,7 +90,16 @@ public:
     bool isSingleWriteMode();
     bool isContinuousWriteMode();
     
-    // ============ RESET FUNCTIONS ============
+// ============ NDEF / URL SETTINGS (persistent) ============
+      void setNdefUrlTemplate(const String& tpl);  // e.g. "https://x.nl/nfc/{uid}"
+      String getNdefUrlTemplate();
+      void setNdefEnabled(bool enabled);            // write NDEF on personalization
+      bool isNdefEnabled();
+      // writeMode: "keys_and_ndef" | "keys_only" | "ndef_only"
+      void setNdefWriteMode(const String& mode);
+      String getNdefWriteMode();
+
+      // ============ RESET FUNCTIONS ============
     void resetNetwork();
     void factoryReset();
 };

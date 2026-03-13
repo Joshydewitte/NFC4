@@ -972,6 +972,63 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   // Now derivedKey is available (from either ESP32 or Server mode)
   // Continue with AN12196 personalization flow
   
+  // ═══════════════════════════════════════════════════════════════
+  // NDEF ONLY MODE: skip key change, just auth + write NDEF URL
+  // ═══════════════════════════════════════════════════════════════
+  String ndefWriteMode = systemConfig.getNdefWriteMode();
+
+  if (ndefWriteMode == "ndef_only") {
+    Serial.println(F("\n[NDEF-ONLY] Authenticeer met huidige key + schrijf NDEF URL"));
+    webServer.broadcastWriteCardStatus(uid, "processing", "NDEF-only: activeer kaart...");
+
+    if (ntag424Handler == nullptr) {
+      webServer.broadcastWriteCardStatus(uid, "error", "NTAG424 handler niet geïnitialiseerd");
+      return;
+    }
+    ntag424Handler->resetSession();
+
+    if (!ntag424Handler->activateCard()) {
+      webServer.broadcastWriteCardStatus(uid, "error", "ISO-DEP activatie mislukt");
+      return;
+    }
+
+    webServer.broadcastWriteCardStatus(uid, "processing", "Authenticeer met afgeleide key...");
+    NTAG424Handler::AuthResult ndefAuthResult;
+    if (!ntag424Handler->authenticateEV2First(0, derivedKey, ndefAuthResult)) {
+      webServer.broadcastWriteCardStatus(uid, "error", "Auth mislukt: " + ndefAuthResult.errorMessage);
+      ntag424Handler->resetSession();
+      return;
+    }
+    Serial.println(F("    ✅ Auth geslaagd"));
+
+    String urlTemplate = systemConfig.getNdefUrlTemplate();
+    String resolvedUrl = urlTemplate;
+    resolvedUrl.replace("{uid}", uid);
+    if (resolvedUrl.indexOf("{id}") >= 0) {
+      String masterSecret = systemConfig.getMasterSecret();
+      String ndefId = NTAG424Crypto::deriveNdefId(masterSecret, uid, 10);
+      resolvedUrl.replace("{id}", ndefId);
+    }
+    Serial.print(F("    NDEF URL: "));
+    Serial.println(resolvedUrl);
+    webServer.broadcastWriteCardStatus(uid, "processing", "Schrijf URL: " + resolvedUrl);
+
+    if (!ntag424Handler->writeNDEF(resolvedUrl)) {
+      webServer.broadcastWriteCardStatus(uid, "error", "NDEF schrijven mislukt");
+      ntag424Handler->resetSession();
+      return;
+    }
+    Serial.println(F("    ✅ NDEF URL geschreven!"));
+    webServer.broadcastWriteCardStatus(uid, "success", "NDEF URL bijgewerkt: " + resolvedUrl);
+
+    if (systemConfig.isSingleWriteMode()) {
+      systemConfig.stopWriteMode();
+      webServer.broadcastLog("Single mode: write mode gestopt", "info");
+    }
+    ntag424Handler->resetSession();
+    return;
+  }
+
   Serial.println(F("\n[2] NTAG424 HANDLER INITIALIZATION"));
   if (ntag424Handler == nullptr) {
     String errorMsg = "NTAG424 handler niet geïnitialiseerd";
@@ -1269,7 +1326,43 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("    • RndA' verification confirmed key is correct"));
   Serial.println(F("    This is the SAME test the server will do!"));
   Serial.println();
-  
+
+  // ═══════════════════════════════════════════════════════════════
+  // [9] WRITE NDEF URL (keys_and_ndef mode only)
+  // Session from verifyResult2 auth is still active.
+  // ═══════════════════════════════════════════════════════════════
+  if (ndefWriteMode == "keys_and_ndef") {
+    Serial.println(F("\n[9] WRITE NDEF URL (keys_and_ndef mode)"));
+    Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    webServer.broadcastWriteCardStatus(uid, "processing", "Schrijf NDEF URL...");
+
+    String urlTemplate = systemConfig.getNdefUrlTemplate();
+    if (urlTemplate.length() == 0) {
+      Serial.println(F("    ⚠️ Geen URL template geconfigureerd - NDEF overgeslagen"));
+      webServer.broadcastWriteCardStatus(uid, "processing", "⚠️ Geen URL template ingesteld in instellingen");
+    } else {
+      String resolvedUrl = urlTemplate;
+      resolvedUrl.replace("{uid}", uid);
+      if (resolvedUrl.indexOf("{id}") >= 0) {
+        String masterSecret = systemConfig.getMasterSecret();
+        String ndefId = NTAG424Crypto::deriveNdefId(masterSecret, uid, 10);
+        resolvedUrl.replace("{id}", ndefId);
+      }
+      Serial.print(F("    URL: "));
+      Serial.println(resolvedUrl);
+      webServer.broadcastWriteCardStatus(uid, "processing", "Schrijf NDEF: " + resolvedUrl);
+
+      if (!ntag424Handler->writeNDEF(resolvedUrl)) {
+        Serial.println(F("    ❌ NDEF schrijven mislukt"));
+        webServer.broadcastWriteCardStatus(uid, "error", "NDEF schrijven mislukt");
+        ntag424Handler->resetSession();
+        return;
+      }
+      Serial.println(F("    ✅ NDEF URL geschreven!"));
+      webServer.broadcastWriteCardStatus(uid, "processing", "✅ NDEF URL: " + resolvedUrl);
+    }
+  }
+
   Serial.println(F("\n╔═══════════════════════════════════════════╗"));
   Serial.println(F("║     ✅ CARD WRITE COMPLETE! ✅            ║"));
   Serial.println(F("╚═══════════════════════════════════════════╝"));

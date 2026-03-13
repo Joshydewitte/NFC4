@@ -146,6 +146,18 @@ public:
      */
     static bool deriveMasterKey(const String& masterSecret, const String& uid,
                                uint8_t* output, uint8_t keyVersion = 1);
+
+    /**
+     * Derive a short URL identifier from master secret + UID using HMAC-SHA256.
+     * Domain-separated from card key derivation via "Kaart#Url" prefix.
+     * Formula: HMAC-SHA256(masterSecret, "Kaart#Url" || UID) → last 'nibbles' hex chars
+     * @param masterSecret - Master secret string (hex, 32 chars)
+     * @param uid          - Card UID as hex string
+     * @param nibbles      - Number of hex characters to return (must be even, default 10)
+     * @return Lowercase hex string of requested length, or "" on failure
+     */
+    static String deriveNdefId(const String& masterSecret, const String& uid,
+                               uint8_t nibbles = 10);
     
     /**
      * Calculate HMAC-SHA256

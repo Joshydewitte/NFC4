@@ -426,6 +426,28 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             </div>
         </div>
 
+        <!-- NDEF Write Mode Selection -->
+        <div class="secret-section">
+            <label class="secret-label">🌐 URL Schrijven</label>
+            <div class="mode-selector">
+                <div class="mode-option" data-ndef="keys_and_ndef">
+                    <div class="mode-icon">🔑🌐</div>
+                    <div class="mode-title">Sleutels + URL</div>
+                    <div class="mode-desc">Schrijf key én NDEF URL</div>
+                </div>
+                <div class="mode-option active" data-ndef="keys_only">
+                    <div class="mode-icon">🔑</div>
+                    <div class="mode-title">Alleen Sleutels</div>
+                    <div class="mode-desc">Geen URL schrijven</div>
+                </div>
+                <div class="mode-option" data-ndef="ndef_only">
+                    <div class="mode-icon">🌐</div>
+                    <div class="mode-title">Alleen URL</div>
+                    <div class="mode-desc">Alleen NDEF URL bijwerken</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Status Section -->
         <div class="status-section" id="statusSection">
             <div id="statusCards"></div>
@@ -464,6 +486,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
         let ws = null;
         let isRunning = false;
         let currentMode = 'single';
+        let ndefWriteMode = 'keys_only';
         let keySource = 'esp32';  // NEW: esp32 or server
         let stats = { success: 0, failed: 0, total: 0 };
 
@@ -619,6 +642,24 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                 this.classList.add('active');
                 currentMode = this.dataset.mode;
                 addLog(`Schrijf modus: ${currentMode === 'single' ? 'Enkele Kaart' : 'Continue'}`, 'info');
+            });
+        });
+
+        // NDEF Write Mode selection
+        document.querySelectorAll('[data-ndef]').forEach(option => {
+            option.addEventListener('click', function() {
+                if (isRunning) return;
+                document.querySelectorAll('[data-ndef]').forEach(opt => {
+                    opt.classList.remove('active');
+                });
+                this.classList.add('active');
+                ndefWriteMode = this.dataset.ndef;
+                const modeLabels = {
+                    'keys_and_ndef': 'Sleutels + URL',
+                    'keys_only': 'Alleen Sleutels',
+                    'ndef_only': 'Alleen URL'
+                };
+                addLog(`URL modus: ${modeLabels[ndefWriteMode]}`, 'info');
             });
         });
 
@@ -788,7 +829,8 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                     mode: currentMode,
                     isFactory: isFactory,
                     isDirectKey: isDirectKey,
-                    previousKey: isFactory ? '' : previousKey  // NEVER send null, always string
+                    previousKey: isFactory ? '' : previousKey,  // NEVER send null, always string
+                    ndefMode: ndefWriteMode
                 };
                 
                 console.log('Request body:', requestBody);

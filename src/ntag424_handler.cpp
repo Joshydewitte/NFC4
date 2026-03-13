@@ -1000,6 +1000,96 @@ bool NTAG424Handler::selectNdefApplication() {
     return transceiveRaw(cmd, 13, response, responseLen);
 }
 
+bool NTAG424Handler::writeNDEF(const String& url) {
+    // Write a minimal NDEF URI record to NTAG424 NDEF file (File No 0x02, ISO EF E104).
+    //
+    // Uses sendCommand() (CLA=90, adds Le=00) which is required for native DESFire
+    // commands via ISO 7816-4 wrapping. transceiveRaw() builds the same PCB+APDU
+    // but WITHOUT the Le byte, causing SW=917E (Length Error) on WriteData.
+    //
+    // NFC Forum Type 4 Tag NDEF file format (raw NDEF, no TLV wrapper):
+    //   Bytes 0-1:  NLEN  (big-endian uint16) = byte length of the NDEF message
+    //   Bytes 2..:  NDEF message (raw NDEF records)
+    //
+    // NDEF URI Well-known record (Short Record SR=1):
+    //   0xD1  flags (MB=1 ME=1 CF=0 SR=1 IL=0 TNF=1 Well-known)
+    //   0x01  type_length = 1
+    //   ??    payload_length = 1(uri_id) + url_body_len
+    //   'U'   type (0x55)
+    //   0x04  URI identifier (0x04=https://, 0x03=http://, 0x00=no abbreviation)
+    //   ...   URL body (scheme prefix removed)
+    //
+    // sendCommand() wraps as: 90 8D 00 00 Lc [FileNo Offset(3LE) Length(3LE) data] 00
+
+    // Normalise scheme to lower-case for matching
+    String urlLower = url;
+    urlLower.toLowerCase();
+
+    String shortUrl = url;
+    uint8_t uriIdentifier = 0x00;  // no abbreviation (fallback)
+    if (urlLower.startsWith("https://")) {
+        shortUrl = url.substring(8);
+        uriIdentifier = 0x04;
+    } else if (urlLower.startsWith("http://")) {
+        shortUrl = url.substring(7);
+        uriIdentifier = 0x03;
+    }
+
+    uint8_t shortLen = (uint8_t)shortUrl.length();
+    if (shortLen > 220) {
+        logError("NDEF URL too long (max ~220 chars)");
+        return false;
+    }
+
+    // NDEF record: header(3) + type(1) + payload(1+shortLen)
+    uint8_t payloadLen = 1 + shortLen;         // uriId + url body
+    uint8_t recordLen  = 3 + 1 + payloadLen;   // 0xD1 typeLen payloadLen + type + payload
+    uint16_t nlen      = (uint16_t)recordLen;  // NLEN = size of this single NDEF record
+
+    // Build the NDEF file content (NLEN + record)
+    uint8_t fileBuf[256];
+    size_t filePos = 0;
+
+    fileBuf[filePos++] = (uint8_t)((nlen >> 8) & 0xFF); // NLEN hi
+    fileBuf[filePos++] = (uint8_t)(nlen & 0xFF);         // NLEN lo
+    fileBuf[filePos++] = 0xD1;          // MB=1 ME=1 CF=0 SR=1 IL=0 TNF=001
+    fileBuf[filePos++] = 0x01;          // Type length = 1
+    fileBuf[filePos++] = payloadLen;    // Payload length
+    fileBuf[filePos++] = 'U';           // Record type = URI
+    fileBuf[filePos++] = uriIdentifier; // URI scheme identifier
+    memcpy(fileBuf + filePos, shortUrl.c_str(), shortLen);
+    filePos += shortLen;
+
+    // Build WriteData native command (without CLA/P1/P2 - sendCommand adds those):
+    //   [INS=0x8D] [FileNo] [Offset(3 LE)] [Length(3 LE)] [FileData]
+    uint8_t cmd[1 + 7 + 256];
+    cmd[0] = 0x8D;                      // INS: WriteData
+    cmd[1] = 0x02;                      // FileNo = 02 (NDEF file)
+    cmd[2] = 0x00;                      // Offset byte 0 (LE)
+    cmd[3] = 0x00;                      // Offset byte 1
+    cmd[4] = 0x00;                      // Offset byte 2
+    cmd[5] = (uint8_t)(filePos & 0xFF);         // Length byte 0 (LE)
+    cmd[6] = (uint8_t)((filePos >> 8) & 0xFF);  // Length byte 1
+    cmd[7] = 0x00;                      // Length byte 2
+    memcpy(cmd + 8, fileBuf, filePos);
+    size_t cmdLen = 8 + filePos;        // INS(1) + params(7) + data
+
+    char dbgBuf[72];
+    sprintf(dbgBuf, ">> WriteData File02 (NDEF), fileLen=%u NLEN=%u", (unsigned)filePos, (unsigned)nlen);
+    logDebug(dbgBuf);
+    logToWeb("Schrijf NDEF URL naar kaart...", "info");
+
+    uint8_t response[16];
+    size_t responseLen = sizeof(response);
+    if (!sendCommand(cmd, cmdLen, response, responseLen)) {
+        logToWeb("NDEF URL schrijven mislukt", "error");
+        return false;
+    }
+    logDebug("<< NDEF write OK (SW=9100)");
+    logToWeb("NDEF URL geschreven", "success");
+    return true;
+}
+
 bool NTAG424Handler::selectApplication(const uint8_t* aid) {
     // SelectApplication uses ISO7816 SELECT command (INS=0x5A) with AID
     // Must be sent as raw ISO7816 command, NOT wrapped in NTAG424 native format

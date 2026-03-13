@@ -339,6 +339,48 @@ bool SystemConfig::isContinuousWriteMode() {
     return writeMode == "continuous";
 }
 
+// ============ NDEF / URL SETTINGS ============
+
+void SystemConfig::setNdefUrlTemplate(const String& tpl) {
+    prefs.begin("system", false);
+    prefs.putString("ndef_url_tpl", tpl);
+    prefs.end();
+}
+
+String SystemConfig::getNdefUrlTemplate() {
+    prefs.begin("system", true);
+    String v = prefs.getString("ndef_url_tpl", "");
+    prefs.end();
+    return v;
+}
+
+void SystemConfig::setNdefEnabled(bool enabled) {
+    prefs.begin("system", false);
+    prefs.putBool("ndef_en", enabled);
+    prefs.end();
+}
+
+bool SystemConfig::isNdefEnabled() {
+    prefs.begin("system", true);
+    bool v = prefs.getBool("ndef_en", false);
+    prefs.end();
+    return v;
+}
+
+void SystemConfig::setNdefWriteMode(const String& mode) {
+    prefs.begin("system", false);
+    prefs.putString("ndef_mode", mode);
+    prefs.end();
+}
+
+String SystemConfig::getNdefWriteMode() {
+    prefs.begin("system", true);
+    // Default: keys_and_ndef when NDEF is enabled
+    String v = prefs.getString("ndef_mode", "keys_only");
+    prefs.end();
+    return v;
+}
+
 // ============ RESET FUNCTIONS ============
 
 void SystemConfig::resetNetwork() {

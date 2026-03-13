@@ -483,6 +483,58 @@ bool NTAG424Crypto::deriveMasterKey(const String& masterSecret, const String& ui
     return true;
 }
 
+String NTAG424Crypto::deriveNdefId(const String& masterSecret, const String& uid,
+                                   uint8_t nibbles) {
+    // nibbles must be even and <= 64 (32 bytes → 64 hex chars)
+    if (nibbles == 0 || nibbles > 64 || nibbles % 2 != 0) return "";
+
+    uint8_t masterSecretBytes[16];
+    if (masterSecret.length() != 32) return "";
+    for (int i = 0; i < 16; i++) {
+        char hex[3] = {masterSecret[i*2], masterSecret[i*2+1], 0};
+        masterSecretBytes[i] = (uint8_t)strtol(hex, NULL, 16);
+    }
+
+    // Domain label: "Kaart#Url" (ASCII bytes)
+    const char* label = "Kaart#Url";
+    size_t labelLen = strlen(label);
+
+    // Clean UID (remove colons/spaces/dashes)
+    String cleanUid = uid;
+    cleanUid.replace(":", "");
+    cleanUid.replace(" ", "");
+    cleanUid.replace("-", "");
+    cleanUid.toUpperCase();
+    size_t uidLen = cleanUid.length() / 2;
+    if (cleanUid.length() % 2 != 0 || uidLen > 16) return "";
+
+    uint8_t uidBytes[16];
+    for (size_t i = 0; i < uidLen; i++) {
+        char h[3] = {cleanUid[i*2], cleanUid[i*2+1], 0};
+        uidBytes[i] = (uint8_t)strtol(h, NULL, 16);
+    }
+
+    // data = "Kaart#Url" || UID_bytes
+    uint8_t data[9 + 16];  // label(9) + UID(max 16)
+    memcpy(data, label, labelLen);
+    memcpy(data + labelLen, uidBytes, uidLen);
+    size_t dataLen = labelLen + uidLen;
+
+    uint8_t hmac[32];
+    if (!calculateHMAC_SHA256(masterSecretBytes, 16, data, dataLen, hmac)) return "";
+
+    // Return last 'nibbles' hex chars (from end of HMAC)
+    // e.g. nibbles=10 → 5 bytes → last 5 bytes of hmac
+    uint8_t byteCount = nibbles / 2;
+    String result = "";
+    for (uint8_t i = 32 - byteCount; i < 32; i++) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", hmac[i]);
+        result += buf;
+    }
+    return result;
+}
+
 // Helper for CMAC subkey generation (not used with mbedtls built-in CMAC)
 void NTAG424Crypto::generateCMACSubkey(const uint8_t* k, uint8_t* k1, uint8_t* k2) {
     // This is a helper function if we need manual CMAC implementation
