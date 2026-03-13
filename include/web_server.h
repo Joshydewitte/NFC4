@@ -245,6 +245,35 @@ private:
             if (!requireAuth()) return;
             handleWriteStop();
         });
+
+        // Favicon — browsers always request this; serve a minimal response so
+        // it never shows as an unhandled 404 in the serial log.
+        httpServer.on("/favicon.ico", HTTP_GET, [this]() {
+            httpServer.send(204); // No Content
+        });
+
+        // /ws on port 80 — browser cache may try WebSocket upgrades here even
+        // though the real WebSocket server is on port 81. Register it explicitly
+        // so the Arduino WebServer doesn't log "request handler not found".
+        httpServer.on("/ws", HTTP_GET, [this]() {
+            httpServer.send(426, "text/plain",
+                "WebSocket server is on port 81. Connect to ws://<ip>:81/");
+        });
+
+        // Catch-all 404 handler — replaces the noisy internal WebServer error log.
+        httpServer.onNotFound([this]() {
+            String method = (httpServer.method() == HTTP_GET) ? "GET" : "POST";
+            String uri    = httpServer.uri();
+            Serial.println("[WEB] 404 " + method + " " + uri);
+            if (uri.startsWith("/api/")) {
+                httpServer.send(404, "application/json",
+                    "{\"error\":\"Not found\",\"path\":\"" + uri + "\"}");
+            } else {
+                // Unknown page — redirect to root so the user lands somewhere useful
+                httpServer.sendHeader("Location", "/");
+                httpServer.send(302);
+            }
+        });
     }
     
     // ============ SESSION MANAGEMENT ============

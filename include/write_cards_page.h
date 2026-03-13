@@ -469,7 +469,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
 
         // Initialize WebSocket connection
         function initWebSocket() {
-            ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+            ws = new WebSocket('ws://' + window.location.hostname + ':81/');
             
             ws.onopen = function() {
                 addLog('WebSocket verbonden', 'success');
@@ -521,7 +521,9 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             if (data.type === 'write_card_status') {
                 updateCardStatus(data);
             } else if (data.type === 'log') {
-                addLog(data.message, data.level || 'info');
+                const msg = (data.data && data.data.message) ? data.data.message : data.message;
+                const lvl = (data.data && data.data.level)   ? data.data.level   : (data.level || 'info');
+                addLog(msg, lvl);
             }
         }
 

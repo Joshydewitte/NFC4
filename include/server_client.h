@@ -45,52 +45,93 @@ public:
         return serverOnline;
     }
     
-    bool testConnection() {
-        if (serverUrl.isEmpty()) {
-            Serial.println(F("No server URL configured"));
-            return false;
+    // ─── Ping / health-check ────────────────────────────────────────────────
+    // Result returned by every ping call so callers can act on new nonces.
+    struct PingResult {
+        bool    online;
+        String  challenge;       // 32 hex chars when server issued a fresh nonce, else ""
+        bool    challengeValid;  // server still has a valid nonce for this reader
+    };
+
+    /**
+     * Single HTTP round-trip to /api/ping.
+     * When requestChallenge=true, appends ?readerId=X&renew=1 so the server
+     * generates and stores a fresh nonce AND returns it here — one request,
+     * two jobs.
+     */
+    PingResult pingServer(bool requestChallenge = false) {
+        PingResult result = { false, "" };
+        if (serverUrl.isEmpty()) return result;
+
+        String url = serverUrl + "/api/ping";
+        if (requestChallenge) {
+            url += "?readerId=" + WiFi.macAddress() + "&renew=1";
         }
-        
-        Serial.print(F("Testing connection to: "));
-        Serial.println(serverUrl + "/api/ping");
-        
-        http.begin(serverUrl + "/api/ping");
-        http.setTimeout(5000);
+
+        http.begin(url);
+        http.setTimeout(3000);   // tight — this is just a heartbeat
         http.addHeader("User-Agent", "ESP32-NFC-Reader");
-        
+
         int httpCode = http.GET();
-        
-        Serial.print(F("HTTP Response Code: "));
-        Serial.println(httpCode);
-        
-        if (httpCode > 0) {
-            String payload = http.getString();
-            Serial.print(F("Response: "));
-            Serial.println(payload);
+        lastPing = millis();
+
+        if (httpCode == 200) {
+            result.online = true;
+            serverOnline = true;
+
+            {
+                String body = http.getString();
+                StaticJsonDocument<256> doc;
+                if (!deserializeJson(doc, body)) {
+                    // challengeValid: server tells us whether our cached nonce still exists
+                    // Default true so older server versions don't trigger false renewals
+                    result.challengeValid = doc["challengeValid"] | true;
+                    if (doc.containsKey("challenge")) {
+                        result.challenge = doc["challenge"].as<String>();
+                        Serial.print(F("   [nonce] Fresh nonce via ping: "));
+                        Serial.println(result.challenge.substring(0, 8) + "...");
+                    }
+                    if (!result.challengeValid) {
+                        Serial.println(F("   \u26a0\ufe0f Ping: server nonce verdwenen (herstart?)"));
+                    }
+                }
+            }
         } else {
-            Serial.print(F("HTTP Error: "));
-            Serial.println(http.errorToString(httpCode));
+            serverOnline = false;
+            Serial.print(F("Ping failed HTTP "));
+            Serial.println(httpCode);
         }
-        
-        bool success = (httpCode == 200);
-        serverOnline = success;
+
         http.end();
-        lastPing = millis();  // reset timer regardless of result
-        
-        Serial.print(F("Server test result: "));
-        Serial.println(success ? "✅ OK" : "❌ FAILED");
-        
-        return success;
+        return result;
     }
-    
-    void periodicPing() {
+
+    /**
+     * Backwards-compatible: returns true/false and runs pingServer(false).
+     * Used at boot before the loop starts.
+     */
+    bool testConnection() {
+        PingResult r = pingServer(false);
+        Serial.print(F("Server test result: "));
+        Serial.println(r.online ? "✅ OK" : "❌ FAILED");
+        return r.online;
+    }
+
+    /**
+     * Call from loop().  Only fires when PING_INTERVAL has elapsed.
+     * Pass requestChallenge=true when the cached nonce is stale/absent so
+     * the server issues a fresh one in the same response.
+     * Returns PingResult so the caller can update its nonce cache.
+     */
+    PingResult periodicPing(bool requestChallenge = false) {
         unsigned long now = millis();
         if (lastPing == 0 || now - lastPing >= PING_INTERVAL) {
-            testConnection();  // testConnection() sets lastPing internally
+            return pingServer(requestChallenge);
         }
+        return { serverOnline, "", true };   // interval not yet elapsed
     }
-    
-    // ============ NFC424 CHALLENGE/RESPONSE ============
+
+    // ─── NFC424 CHALLENGE/RESPONSE ───────────────────────────────────────────
     
     String requestChallenge(const String& cardUID) {
         if (serverUrl.isEmpty()) {
@@ -188,13 +229,16 @@ public:
     struct StartScanResult {
         bool success;
         bool cardKnown;
-        String derivedKeyHex;  // 32 hex chars = K0 for this card
+        String derivedKeyHex;   // 32 hex chars = K0 for this card
+        bool nonceExpired;      // true when server returned 410 (nonce gone/used)
+        String nextChallenge;   // fresh nonce from server when nonceExpired=true
     };
 
     StartScanResult startScan(const String& uid) {
         StartScanResult result;
         result.success = false;
         result.cardKnown = false;
+        result.nonceExpired = false;
 
         if (serverUrl.isEmpty()) {
             Serial.println(F("❌ No server configured"));
@@ -227,6 +271,15 @@ public:
             result.success = true;   // not an error - card just not registered
             result.cardKnown = false;
             Serial.println(F("   Card not registered on server"));
+        } else if (httpCode == 410) {
+            // Nonce expired or already used — server issued a fresh one in the body
+            result.nonceExpired = true;
+            String responseStr = http.getString();
+            StaticJsonDocument<256> doc;
+            if (!deserializeJson(doc, responseStr)) {
+                result.nextChallenge = doc["nextChallenge"].as<String>();
+                Serial.println(F("   ⚠️  scan/start 410 — fresh nonce received"));
+            }
         } else {
             Serial.print(F("❌ scan/start failed: HTTP "));
             Serial.println(httpCode);
@@ -286,7 +339,7 @@ public:
             DeserializationError error = deserializeJson(responseDoc, responseStr);
             
             if (!error) {
-                result.success = true;
+                result.success = responseDoc["success"] | false;
                 result.status = responseDoc["status"].as<String>();
                 result.credits = responseDoc["credits"] | 0;
                 result.message = responseDoc["message"].as<String>();
