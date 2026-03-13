@@ -138,9 +138,14 @@ bool SystemConfig::hasMasterkey() {
 }
 
 void SystemConfig::clearSessionMasterkey() {
+    // Overwrite sensitive data in memory before clearing
+    if (sessionMasterkey.length() > 0) {
+        char* buffer = const_cast<char*>(sessionMasterkey.c_str());
+        memset(buffer, 0, sessionMasterkey.length());
+    }
     sessionMasterkey = "";
     masterkeyActive = false;
-    Serial.println(F("Masterkey cleared"));
+    Serial.println(F("✅ Masterkey veilig gewist uit RAM"));
 }
 
 // ============ NETWORK SETTINGS ============
@@ -215,8 +220,13 @@ String SystemConfig::getMasterSecret() {
 }
 
 void SystemConfig::clearMasterSecret() {
+    // Overwrite sensitive data in memory before clearing
+    if (writeModeMasterSecret.length() > 0) {
+        char* buffer = const_cast<char*>(writeModeMasterSecret.c_str());
+        memset(buffer, 0, writeModeMasterSecret.length());
+    }
     writeModeMasterSecret = "";
-    Serial.println(F("Master secret gewist uit RAM"));
+    Serial.println(F("✅ Master secret veilig gewist uit RAM"));
 }
 
 void SystemConfig::setPreviousKey(const String& key) {
@@ -229,14 +239,48 @@ String SystemConfig::getPreviousKey() {
 }
 
 void SystemConfig::clearPreviousKey() {
+    // Overwrite sensitive data in memory before clearing
+    if (writeModePreviousKey.length() > 0) {
+        char* buffer = const_cast<char*>(writeModePreviousKey.c_str());
+        memset(buffer, 0, writeModePreviousKey.length());
+    }
     writeModePreviousKey = "";
-    Serial.println(F("Previous key gewist uit RAM"));
+    Serial.println(F("✅ Previous key veilig gewist uit RAM"));
 }
 
 void SystemConfig::setIsFactory(bool factory) {
     writeIsFactory = factory;
     Serial.print(F("Factory kaart: "));
     Serial.println(factory ? "ja" : "nee");
+}
+
+void SystemConfig::stopWriteMode() {
+    if (writeActive) {
+        Serial.println(F("\n⏹️  Write mode gestopt - secrets worden gewist..."));
+        writeActive = false;
+        clearMasterSecret();
+        clearPreviousKey();
+        writeMode = "";
+        writeIsFactory = false;
+        writeIsDirectKey = false;
+        keySource = "esp32";
+        Serial.println(F("✅ Write mode volledig opgeschoond"));
+    }
+}
+
+bool SystemConfig::checkWriteTimeout() {
+    if (!writeActive) {
+        return false;
+    }
+    
+    unsigned long elapsed = millis() - writeActiveTimestamp;
+    if (elapsed >= WRITE_MODE_TIMEOUT_MS) {
+        Serial.println(F("\n⏱️  Write mode timeout bereikt (5 minuten)"));
+        stopWriteMode();
+        return true;
+    }
+    
+    return false;
 }
 
 bool SystemConfig::getIsFactory() {
@@ -275,8 +319,12 @@ String SystemConfig::getWriteMode() {
 
 void SystemConfig::setWriteActive(bool active) {
     writeActive = active;
-    Serial.print(F("Write active: "));
-    Serial.println(active ? "YES" : "NO");
+    if (active) {
+        writeActiveTimestamp = millis();
+        Serial.println(F("✅ Write mode geactiveerd - timeout: 5 minuten"));
+    } else {
+        Serial.println(F("Write mode gedeactiveerd"));
+    }
 }
 
 bool SystemConfig::isWriteActive() {

@@ -722,7 +722,21 @@ private:
                 break;
                 
             case WStype_TEXT:
-                // Handle incoming text (if needed)
+                {
+                    // Handle incoming text messages
+                    String message = String((char*)payload);
+                    Serial.printf("WebSocket [%u] received: %s\n", num, message.c_str());
+                    
+                    // Parse simple JSON-like messages
+                    if (message.indexOf("\"type\":\"page_leave\"") > 0 || message.indexOf("\"type\":\"page_change\"") > 0) {
+                        Serial.println(F("Page leave detected - checking write mode..."));
+                        if (config->isWriteActive()) {
+                            Serial.println(F("⚠️ User left write page - stopping write mode"));
+                            config->stopWriteMode();
+                            broadcastLog("Write mode gestopt: gebruiker verliet pagina", "warning");
+                        }
+                    }
+                }
                 break;
         }
     }

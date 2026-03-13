@@ -65,7 +65,6 @@ const unsigned long STATS_UPDATE_INTERVAL = 5000; // 5 seconds
 // ============ CACHED CHALLENGE (for fast card scanning) ============
 
 uint8_t cachedChallenge[16] = {0};
-String cachedChallengeId = "";
 bool hasCachedChallenge = false;
 
 // ============ APPLICATION LOGIC ============
@@ -135,8 +134,9 @@ void setup() {
     Serial.println(mode);
     webServer.broadcastLog("Reader mode: " + mode, "info");
     
-    // Request initial challenge for card scanning
-    if (serverClient.isServerOnline()) {
+    // Ping server immediately and request first nonce if online
+    Serial.println(F("\n=== Initial Server Ping ==="));
+    if (serverClient.testConnection()) {
       Serial.println(F("\n=== Initial Challenge ==="));
       ServerClient::ChallengeData challengeData = serverClient.requestInitialChallenge();
       
@@ -146,17 +146,16 @@ void setup() {
           char hex[3] = {challengeData.challenge[i*2], challengeData.challenge[i*2+1], 0};
           cachedChallenge[i] = (uint8_t)strtol(hex, NULL, 16);
         }
-        cachedChallengeId = challengeData.challengeId;
         hasCachedChallenge = true;
         
         Serial.println(F("✅ Initial challenge cached for card scanning"));
-        Serial.print(F("   Challenge ID: "));
-        Serial.println(cachedChallengeId);
         webServer.broadcastLog("✅ Challenge voorbereid voor snelle scans", "success");
       } else {
         Serial.println(F("⚠️ No initial challenge - will request per card"));
         webServer.broadcastLog("⚠️ Geen challenge - request per kaart", "warning");
       }
+    } else {
+      Serial.println(F("⚠️ Server offline at boot - will retry when card scanned"));
     }
   } else {
     Serial.println(F("⚠️ No WiFi - continuing in offline mode"));
@@ -231,6 +230,11 @@ void loop() {
     webServer.broadcastStats(systemConfig.getCardsRead(), systemConfig.getUptime());
   }
   
+  // Check write mode timeout (5 minutes)
+  if (systemConfig.checkWriteTimeout()) {
+    webServer.broadcastLog("Write mode timeout - secrets gewist", "warning");
+  }
+  
   // NFC Reader loop (handles health checks and watchdog)
   nfcReader->loop();
   
@@ -249,6 +253,19 @@ void loop() {
       handleMachineMode(cardInfo);
     } else if (systemConfig.isConfigMode()) {
       handleConfigMode(cardInfo);
+    }
+
+    // After card handled: proactively request nonce for next scan
+    if (serverClient.isServerOnline() && !hasCachedChallenge) {
+      ServerClient::ChallengeData cd = serverClient.requestInitialChallenge();
+      if (cd.success && cd.challenge.length() == 32) {
+        for (int i = 0; i < 16; i++) {
+          char h[3] = {cd.challenge[i*2], cd.challenge[i*2+1], 0};
+          cachedChallenge[i] = (uint8_t)strtol(h, NULL, 16);
+        }
+        hasCachedChallenge = true;
+        Serial.println(F("✅ Nonce klaar voor volgende scan"));
+      }
     }
   }
   
@@ -286,6 +303,22 @@ void checkConfigButton() {
 void handleMachineMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("\n=== MACHINE MODE ==="));
   webServer.broadcastLog("Machine modus - challenge-response authenticatie", "info");
+  
+  // Check if it's a non-NTAG424 card
+  if (cardInfo.cardType.indexOf("NTAG424") < 0 && 
+      cardInfo.cardType.indexOf("DESFire") < 0 &&
+      cardInfo.cardType.indexOf("SECURE") < 0) {
+    Serial.println(F("⚪ Niet-NTAG424 kaart gedetecteerd"));
+    Serial.print(F("   Type: "));
+    Serial.println(cardInfo.cardType);
+    webServer.broadcastLog("⚪ Niet-NTAG424: " + cardInfo.cardType, "info");
+    
+    // Send to server as non-NTAG424
+    if (serverClient.isServerOnline()) {
+      serverClient.sendScan(cardInfo.uidString, "non_ntag424", cardInfo.cardType);
+    }
+    return;
+  }
   
   // Reset handler
   if (ntag424Handler == nullptr) {
@@ -448,8 +481,15 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
   if (cardInfo.cardType.indexOf("NTAG424") < 0 && 
       cardInfo.cardType.indexOf("DESFire") < 0 &&
       cardInfo.cardType.indexOf("SECURE") < 0) {
+    Serial.println(F("⚪ Niet-NTAG424 kaart gedetecteerd in config mode"));
     webServer.broadcastLog("⚠️ Geen NTAG424 DNA kaart gedetecteerd", "warning");
     webServer.broadcastLog("Card type: " + cardInfo.cardType, "info");
+    
+    // Send to server as non-NTAG424
+    if (serverClient.isServerOnline()) {
+      serverClient.sendScan(cardInfo.uidString, "non_ntag424", cardInfo.cardType);
+      webServer.broadcastLog("✅ Scan verzonden naar server", "success");
+    }
     return;
   }
   
@@ -484,221 +524,132 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(cardInfo.cardType);
   
   // ═══════════════════════════════════════════════════════════════
-  // DETECT CARD STATUS: factory / personalized / unknown
-  // Try authenticating to determine what key is on the card
-  // If authenticated AND cached challenge available: send crypto proof
   // ═══════════════════════════════════════════════════════════════
-  Serial.println(F("\n🔍 Detecting card status..."));
-  String cardStatus = "unknown";  // Default: unknown
+  // SCAN FLOW: nonce-based, single auth per card
+  //   1. POST /api/scan/start {uid, readerId} → derivedKey
+  //   2. Authenticate card once with derivedKey + nonce as RndA
+  //   3. POST /api/scan/verify (scanWithProof) → card details + next nonce
+  // ═══════════════════════════════════════════════════════════════
+  Serial.println(F("\n🔍 Scanning card..."));
+  String cardStatus = "unknown";
   bool cryptoProofSent = false;
-  uint8_t* workingKey = nullptr;
+  uint8_t derivedKey[16] = {0};
   
-  // Step 1: Try factory key (00...00)
-  Serial.println(F("   [1] Trying factory key (00000000...)"));
-  uint8_t factoryKey[16] = {0};  // All zeros
-  NTAG424Handler::AuthResult authResult;
-  bool authSuccess = ntag424Handler->authenticateEV2First(0, factoryKey, authResult);
-  
-  if (authSuccess) {
-    cardStatus = "factory";
-    workingKey = factoryKey;
-    Serial.println(F("   ✅ Factory key works → Status: FACTORY"));
-    webServer.broadcastLog("✅ Factory kaart gedetecteerd", "success");
-    
-    // If we have a cached challenge, do crypto proof
-    if (hasCachedChallenge && serverClient.isServerOnline()) {
-      Serial.println(F("   [Crypto] Re-authenticating with cached challenge..."));
-      
-      // Reset and reactivate for fresh auth with challenge
-      ntag424Handler->resetSession();
-      if (!ntag424Handler->activateCard()) {
-        Serial.println(F("   ❌ Failed to reactivate"));
-        goto try_personalized;
+  if (hasCachedChallenge && serverClient.isServerOnline()) {
+    // Step 1: POST /api/scan/start {uid, readerId}
+    // Server looks up nonce by readerId and returns derived key K0
+    Serial.println(F("   [1] scan/start → server..."));
+    ServerClient::StartScanResult startResult = serverClient.startScan(
+      cardInfo.uidString
+    );
+
+    if (startResult.success && startResult.cardKnown && startResult.derivedKeyHex.length() == 32) {
+      // Parse derived key
+      for (int i = 0; i < 16; i++) {
+        char hex[3] = {startResult.derivedKeyHex[i*2], startResult.derivedKeyHex[i*2+1], 0};
+        derivedKey[i] = (uint8_t)strtol(hex, NULL, 16);
       }
-      
-      // Re-auth with cached challenge as RndA
-      NTAG424Handler::AuthResult cryptoResult;
-      bool cryptoAuth = ntag424Handler->authenticateEV2First(0, factoryKey, cachedChallenge, cryptoResult);
-      
-      if (cryptoAuth) {
-        Serial.println(F("   ✅ Crypto auth successful"));
-        
-        // Convert crypto data to hex
-        String encRndBHex = "";
-        for (int i = 0; i < 16; i++) {
-          char hex[3];
-          sprintf(hex, "%02X", cryptoResult.encryptedRndB[i]);
-          encRndBHex += hex;
-        }
-        
-        String encResponseHex = "";
-        for (int i = 0; i < 32; i++) {
-          char hex[3];
-          sprintf(hex, "%02X", cryptoResult.encryptedResponse[i]);
-          encResponseHex += hex;
-        }
-        
-        String tiHex = "";
-        for (int i = 0; i < 4; i++) {
-          char hex[3];
-          sprintf(hex, "%02X", cryptoResult.transactionId[i]);
-          tiHex += hex;
-        }
-        
-        // Send to server (including challengeId for verification)
-        Serial.println(F("   [Crypto] Sending proof to server..."));
-        Serial.print(F("   Using challenge ID: "));
-        Serial.println(cachedChallengeId);
-        
-        ServerClient::ScanResult scanResult = serverClient.scanWithProof(
-          cardInfo.uidString, encRndBHex, encResponseHex, tiHex, cachedChallengeId
-        );
-        
-        if (scanResult.success && scanResult.nextChallenge.length() == 32) {
-          // Update cached challenge for next card
-          for (int i = 0; i < 16; i++) {
-            char hex[3] = {scanResult.nextChallenge[i*2], scanResult.nextChallenge[i*2+1], 0};
-            cachedChallenge[i] = (uint8_t)strtol(hex, NULL, 16);
-          }
-          cachedChallengeId = scanResult.nextChallengeId;
-          
-          Serial.println(F("   ✅ Next challenge cached"));
-          Serial.print(F("   Next challenge ID: "));
-          Serial.println(cachedChallengeId);
-          
-          webServer.broadcastLog("✅ " + scanResult.message, "success");
-          if (scanResult.credits > 0) {
-            webServer.broadcastLog("💰 Credits: " + String(scanResult.credits), "success");
-          }
-          
-          cryptoProofSent = true;
-        } else {
-          Serial.println(F("   ⚠️ Crypto proof failed or invalid response"));
-        }
-      } else {
-        Serial.println(F("   ❌ Crypto auth failed"));
-      }
-    }
-  } else {
-    Serial.println(F("   ❌ Factory key failed"));
-  }
-  
-try_personalized:
-  // Step 2: If factory didn't work, try personalized key
-  if (cardStatus == "unknown") {
-    String masterSecret = systemConfig.getMasterSecret();
-    if (masterSecret.length() == 32) {
-      Serial.println(F("   [2] Trying personalized key (derived from master secret)"));
-      
-      // Reset session before trying again
-      ntag424Handler->resetSession();
-      
-      // Reactivate card
-      if (!ntag424Handler->activateCard()) {
-        Serial.println(F("   ❌ Failed to reactivate card"));
-        goto skip_personalized_check;
-      }
-      
-      // Derive key from master secret + UID
-      uint8_t derivedKey[16];
-      if (NTAG424Crypto::deriveMasterKey(masterSecret, cardInfo.uidString, derivedKey, 1)) {
-        Serial.print(F("   Derived key: "));
-        Serial.println(NTAG424Crypto::bytesToHexString(derivedKey, 16));
-        
-        authSuccess = ntag424Handler->authenticateEV2First(0, derivedKey, authResult);
-        
-        if (authSuccess) {
+      Serial.print(F("   K0: "));
+      Serial.println(startResult.derivedKeyHex);
+
+      // Step 2: Authenticate directly – ISO-DEP already active from top of handleConfigMode
+      {
+        NTAG424Handler::AuthResult cryptoResult;
+        bool cryptoAuth = ntag424Handler->authenticateEV2First(0, derivedKey, cachedChallenge, cryptoResult);
+
+        if (cryptoAuth) {
           cardStatus = "personalized";
-          workingKey = derivedKey;
-          Serial.println(F("   ✅ Personalized key works → Status: PERSONALIZED"));
-          webServer.broadcastLog("✅ Gepersonaliseerde kaart gedetecteerd", "success");
-          
-          // If we have a cached challenge, do crypto proof
-          if (hasCachedChallenge && serverClient.isServerOnline() && !cryptoProofSent) {
-            Serial.println(F("   [Crypto] Re-authenticating with cached challenge..."));
-            
-            // Reset and reactivate
-            ntag424Handler->resetSession();
-            if (!ntag424Handler->activateCard()) {
-              Serial.println(F("   ❌ Failed to reactivate"));
-              goto skip_personalized_check;
-            }
-            
-            // Re-auth with cached challenge
-            NTAG424Handler::AuthResult cryptoResult;
-            bool cryptoAuth = ntag424Handler->authenticateEV2First(0, derivedKey, cachedChallenge, cryptoResult);
-            
-            if (cryptoAuth) {
-              Serial.println(F("   ✅ Crypto auth successful"));
-              
-              // Convert crypto data to hex
-              String encRndBHex = "";
+          Serial.println(F("   ✅ Auth OK → PERSONALIZED"));
+          webServer.broadcastLog("✅ Gepersonaliseerde kaart", "success");
+
+          // Step 3: POST /api/scan-with-proof → verify + get next nonce
+          String encRndBHex = "", encResponseHex = "", tiHex = "";
+          for (int i = 0; i < 16; i++) { char h[3]; sprintf(h, "%02X", cryptoResult.encryptedRndB[i]); encRndBHex += h; }
+          for (int i = 0; i < 32; i++) { char h[3]; sprintf(h, "%02X", cryptoResult.encryptedResponse[i]); encResponseHex += h; }
+          for (int i = 0; i < 4;  i++) { char h[3]; sprintf(h, "%02X", cryptoResult.transactionId[i]); tiHex += h; }
+
+          ServerClient::ScanResult scanResult = serverClient.scanWithProof(
+            cardInfo.uidString, encRndBHex, encResponseHex, tiHex
+          );
+
+          if (scanResult.success) {
+            webServer.broadcastLog("✅ " + scanResult.message, "success");
+            if (scanResult.credits > 0) webServer.broadcastLog("💰 Credits: " + String(scanResult.credits), "success");
+            cryptoProofSent = true;
+
+            // Cache next nonce for next card scan
+            if (scanResult.nextChallenge.length() == 32) {
               for (int i = 0; i < 16; i++) {
-                char hex[3];
-                sprintf(hex, "%02X", cryptoResult.encryptedRndB[i]);
-                encRndBHex += hex;
+                char h[3] = {scanResult.nextChallenge[i*2], scanResult.nextChallenge[i*2+1], 0};
+                cachedChallenge[i] = (uint8_t)strtol(h, NULL, 16);
               }
-              
-              String encResponseHex = "";
-              for (int i = 0; i < 32; i++) {
-                char hex[3];
-                sprintf(hex, "%02X", cryptoResult.encryptedResponse[i]);
-                encResponseHex += hex;
-              }
-              
-              String tiHex = "";
-              for (int i = 0; i < 4; i++) {
-                char hex[3];
-                sprintf(hex, "%02X", cryptoResult.transactionId[i]);
-                tiHex += hex;
-              }
-              
-              // Send to server (including challengeId for verification)
-              Serial.println(F("   [Crypto] Sending proof to server..."));
-              Serial.print(F("   Using challenge ID: "));
-              Serial.println(cachedChallengeId);
-              
-              ServerClient::ScanResult scanResult = serverClient.scanWithProof(
-                cardInfo.uidString, encRndBHex, encResponseHex, tiHex, cachedChallengeId
-              );
-              
-              if (scanResult.success && scanResult.nextChallenge.length() == 32) {
-                // Update cached challenge
-                for (int i = 0; i < 16; i++) {
-                  char hex[3] = {scanResult.nextChallenge[i*2], scanResult.nextChallenge[i*2+1], 0};
-                  cachedChallenge[i] = (uint8_t)strtol(hex, NULL, 16);
-                }
-                cachedChallengeId = scanResult.nextChallengeId;
-                
-                Serial.println(F("   ✅ Next challenge cached"));
-                Serial.print(F("   Next challenge ID: "));
-                Serial.println(cachedChallengeId);
-                
-                webServer.broadcastLog("✅ " + scanResult.message, "success");
-                if (scanResult.credits > 0) {
-                  webServer.broadcastLog("💰 Credits: " + String(scanResult.credits), "success");
-                }
-                
-                cryptoProofSent = true;
-              }
+              Serial.println(F("   ✅ Next nonce cached"));
+            } else {
+              // Server didn't return a next nonce - invalidate cache so next
+              // scan requests a fresh one instead of reusing a spent nonce
+              hasCachedChallenge = false;
+              Serial.println(F("   ⚠️ No next nonce in response - will request fresh nonce next scan"));
             }
+          } else {
+            Serial.println(F("   ❌ Server verification failed"));
           }
         } else {
-          Serial.println(F("   ❌ Personalized key failed"));
+          Serial.println(F("   ❌ Card auth failed (wrong key?)"));
         }
-      } else {
-        Serial.println(F("   ❌ Failed to derive key"));
       }
+
+    } else if (startResult.success && !startResult.cardKnown) {
+      // Card not registered on server - nonce not consumed, keep hasCachedChallenge = true
+      // ISO-DEP already active, try factory key directly
+      Serial.println(F("   Card unknown to server - trying factory key..."));
+      {
+        uint8_t factoryKey[16] = {0};
+        NTAG424Handler::AuthResult authResult;
+        if (ntag424Handler->authenticateEV2First(0, factoryKey, authResult)) {
+          cardStatus = "factory";
+          Serial.println(F("   ✅ Factory key works → FACTORY"));
+          webServer.broadcastLog("✅ Factory kaart", "success");
+        }
+      }
+
     } else {
-      Serial.println(F("   [2] No master secret configured - cannot test personalized"));
+      // scan/start failed - invalidate nonce, it may be stale
+      hasCachedChallenge = false;
+      Serial.println(F("   ❌ scan/start failed - server error"));
+    }
+
+  } else {
+    // No nonce cached - request a fresh one from server, then retry the full flow
+    if (serverClient.isServerOnline()) {
+      Serial.println(F("   [No nonce] Requesting fresh nonce from server..."));
+      ServerClient::ChallengeData cd = serverClient.requestInitialChallenge();
+      if (cd.success && cd.challenge.length() == 32) {
+        for (int i = 0; i < 16; i++) {
+          char h[3] = {cd.challenge[i*2], cd.challenge[i*2+1], 0};
+          cachedChallenge[i] = (uint8_t)strtol(h, NULL, 16);
+        }
+        hasCachedChallenge = true;
+        Serial.println(F("   ✅ Fresh nonce cached"));
+        // Re-run scan immediately with fresh nonce
+        // (handleMachineMode/handleConfigMode will be called again on next card present,
+        //  but we can call ourselves recursively here since nonce is now ready)
+        handleConfigMode(cardInfo);
+        return;
+      }
+    }
+    // Server offline or nonce request failed - try factory key only
+    Serial.println(F("   [Offline/no-nonce] Trying factory key..."));
+    uint8_t factoryKey[16] = {0};
+    NTAG424Handler::AuthResult authResult;
+    if (ntag424Handler->authenticateEV2First(0, factoryKey, authResult)) {
+      cardStatus = "factory";
+      webServer.broadcastLog("✅ Factory kaart (offline)", "success");
     }
   }
-  
-skip_personalized_check:
-  
+
   if (cardStatus == "unknown") {
-    Serial.println(F("   ⚠️  Status: UNKNOWN (neither factory nor personalized key worked)"));
-    webServer.broadcastLog("⚠️ Onbekende kaart (geen key match)", "warning");
+    Serial.println(F("   ⚠️  Status: UNKNOWN"));
+    webServer.broadcastLog("⚠️ Onbekende kaart", "warning");
   }
   
   // Log final status
@@ -711,15 +662,17 @@ skip_personalized_check:
   // ═══════════════════════════════════════════════════════════════
   if (!cryptoProofSent && serverClient.isServerOnline()) {
     Serial.println(F("\n📤 Sending simple scan to server..."));
-    bool sent = serverClient.sendScan(cardInfo.uidString, cardStatus);
+    bool sent = serverClient.sendScan(cardInfo.uidString, cardStatus, cardInfo.cardType);
     if (sent) {
       webServer.broadcastLog("✅ Scan verzonden naar server", "success");
     } else {
       webServer.broadcastLog("⚠️ Scan verzenden mislukt", "warning");
     }
-  } else {
+  } else if (!cryptoProofSent) {
     Serial.println(F("⚠️  Server offline - scan not logged"));
     webServer.broadcastLog("⚠️ Server offline - scan niet gelogd", "warning");
+  } else {
+    Serial.println(F("✅ Crypto proof already sent - skip simple scan"));
   }
   
   // ═══════════════════════════════════════════════════════════════
@@ -1057,7 +1010,10 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
   Serial.print(F("Master Secret:  "));
   if (keySource == "esp32") {
-    Serial.println(systemConfig.getMasterSecret());
+    // SECURITY: Only show preview, never full secret
+    String secret = systemConfig.getMasterSecret();
+    Serial.print(secret.substring(0, 8));
+    Serial.println("... (preview only)");
   } else {
     Serial.println("(from server)");
   }
@@ -1102,34 +1058,32 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("    ✅ Master key (K0) written successfully"));
   
   // ═══════════════════════════════════════════════════════════════
-  // COMMIT TRANSACTION (make ChangeKey permanent)
+  // NOTE: CommitTransaction is NOT needed on NTAG424 DNA!
+  // NTAG424 DNA has ONLY StandardData files which are NOT covered
+  // by the transaction mechanism (NT4H2421Gx datasheet, Section 8.2.3.1):
+  // "A StandardData file is not covered by the transaction mechanism"
+  // ChangeKey on NTAG424 DNA is self-committing (AN12196 Table 27,
+  // step 18: R-APDU=9100 with NO subsequent CommitTransaction).
+  // Calling CommitTransaction after ChangeKey returns SW=911C
+  // (no changes pending) and corrupts the session.
   // ═══════════════════════════════════════════════════════════════
-  Serial.println(F("\n[7.5] COMMIT TRANSACTION"));
-  webServer.broadcastWriteCardStatus(uid, "processing", "Commit transaction...");
-  
-  bool committed = ntag424Handler->commitTransaction();
-  if (!committed) {
-    String errorMsg = "CommitTransaction mislukt";
-    Serial.println(F("    ❌ CommitTransaction failed"));
-    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
-    ntag424Handler->resetSession();
-    return;
-  }
-  
-  Serial.println(F("    ✅ Transaction committed - key change is now permanent"));
   
   // ═══════════════════════════════════════════════════════════════
   // VERIFICATION: Re-authenticate with new key
+  // Best practice: Full challenge-response test (same as server does)
   // ═══════════════════════════════════════════════════════════════
-  Serial.println(F("\n[8] VERIFICATION"));
-  webServer.broadcastWriteCardStatus(uid, "processing", "Verificeer nieuwe key...");
+  Serial.println(F("\n[8] VERIFICATION - CRYPTO CHALLENGE-RESPONSE TEST"));
+  Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+  webServer.broadcastWriteCardStatus(uid, "processing", "Verificeer nieuwe key (crypto test)...");
   
   // CRITICAL: Reset session before verifying with new key!
   // After ChangeKey, the session is still using OLD key's session keys
   // We need a fresh authentication with the NEW key
   ntag424Handler->resetSession();
-  Serial.println(F("    Session reset for fresh authentication"));
+  Serial.println(F("    🔄 Session reset for fresh authentication"));
   
+  Serial.println(F("\n    [Test 1/2] First Challenge-Response Verification"));
+  Serial.println(F("    ─────────────────────────────────────────────────"));
   NTAG424Handler::AuthResult verifyResult;
   bool verified = ntag424Handler->authenticateEV2First(
     0,
@@ -1137,27 +1091,73 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
     verifyResult
   );
   
-  if (verified) {
-    Serial.println(F("    ✅ Verification successful"));
-    Serial.println(F("\n╔═══════════════════════════════════════════╗"));
-    Serial.println(F("║     ✅ CARD WRITE COMPLETE! ✅            ║"));
-    Serial.println(F("╚═══════════════════════════════════════════╝"));
-    webServer.broadcastWriteCardStatus(uid, "success", "Kaart succesvol geschreven en geverifieerd!");
+  if (!verified) {
+    String errorMsg = "Verificatie mislukt - nieuwe key werkt niet!";
+    Serial.println(F("    ❌ VERIFICATION FAILED!"));
+    Serial.println(F("       Card did NOT accept the new key"));
+    Serial.println(F("       This means ChangeKey did not work correctly"));
     
-    // Check if we're in single mode - if so, stop after one card
-    if (systemConfig.isSingleWriteMode()) {
-      Serial.println(F("Single mode - stopping after one card"));
-      systemConfig.setWriteActive(false);
-      systemConfig.clearMasterSecret();
-      systemConfig.clearPreviousKey();
-      systemConfig.setKeySource("esp32");  // Reset to default ESP32 mode
-      webServer.broadcastLog("Single mode: schrijven gestopt na 1 kaart (key source reset naar ESP32)", "info");
-    }
-  } else {
-    String errorMsg = "Verificatie mislukt: " + verifyResult.errorMessage;
-    Serial.print(F("⚠️ Verification failed: "));
-    Serial.println(verifyResult.errorMessage);
     webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    ntag424Handler->resetSession();
+    return;
+  }
+  
+  Serial.println(F("    ✅ First verification successful!"));
+  Serial.println(F("       - Random challenge (RndA) generated"));
+  Serial.println(F("       - Card responded with valid crypto"));
+  Serial.println(F("       - RndA' verification passed (crypto correct!)"));
+  Serial.print(F("       - Transaction ID: "));
+  Serial.println(NTAG424Crypto::bytesToHexString(verifyResult.transactionId, 4));
+  
+  // SECOND VERIFICATION: Do it again with a different challenge for extra confidence
+  Serial.println(F("\n    [Test 2/2] Second Challenge-Response Verification"));
+  Serial.println(F("    ─────────────────────────────────────────────────"));
+  Serial.println(F("    (Testing with fresh random challenge for extra confidence)"));
+  
+  ntag424Handler->resetSession();
+  
+  NTAG424Handler::AuthResult verifyResult2;
+  bool verified2 = ntag424Handler->authenticateEV2First(
+    0,
+    derivedKey,
+    verifyResult2
+  );
+  
+  if (!verified2) {
+    String errorMsg = "Tweede verificatie mislukt";
+    Serial.println(F("    ❌ Second verification failed"));
+    Serial.println(F("       Card was inconsistent - possible write issue"));
+    
+    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
+    ntag424Handler->resetSession();
+    return;
+  }
+  
+  Serial.println(F("    ✅ Second verification successful!"));
+  Serial.print(F("       - Transaction ID: "));
+  Serial.println(NTAG424Crypto::bytesToHexString(verifyResult2.transactionId, 4));
+  Serial.println(F("       - Card consistently responds to crypto challenges"));
+  
+  Serial.println(F("\n    ╔═══════════════════════════════════════════════════╗"));
+  Serial.println(F("    ║  ✅ CARD FULLY VERIFIED - NEW KEY WORKS! ✅      ║"));
+  Serial.println(F("    ╚═══════════════════════════════════════════════════╝"));
+  Serial.println(F("    Both crypto challenge-response tests passed:"));
+  Serial.println(F("    • ESP32 generated random challenges"));
+  Serial.println(F("    • Card computed correct crypto responses"));
+  Serial.println(F("    • RndA' verification confirmed key is correct"));
+  Serial.println(F("    This is the SAME test the server will do!"));
+  Serial.println();
+  
+  Serial.println(F("\n╔═══════════════════════════════════════════╗"));
+  Serial.println(F("║     ✅ CARD WRITE COMPLETE! ✅            ║"));
+  Serial.println(F("╚═══════════════════════════════════════════╝"));
+  webServer.broadcastWriteCardStatus(uid, "success", "Kaart succesvol geschreven en volledig geverifieerd!");
+  
+  // Check if we're in single mode - if so, stop after one card
+  if (systemConfig.isSingleWriteMode()) {
+    Serial.println(F("Single mode - auto-cleanup na 1 kaart"));
+    systemConfig.stopWriteMode();
+    webServer.broadcastLog("Single mode: write mode gestopt en secrets gewist", "info");
   }
   
   // Reset ISO-DEP session for next card

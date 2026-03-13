@@ -20,9 +20,13 @@ private:
     String writeModePreviousKey;
     String writeMode;  // "single" or "continuous"
     bool writeActive;
+    unsigned long writeActiveTimestamp;  // When write mode was activated
     bool writeIsFactory;
     bool writeIsDirectKey;  // true = Previous Key is direct key, false = Previous Key is master secret
     String keySource;  // "esp32" or "server"
+    
+    // Constants
+    static const unsigned long WRITE_MODE_TIMEOUT_MS = 300000;  // 5 minutes
     
 public:
     SystemConfig();
@@ -78,6 +82,8 @@ public:
     void setKeySource(const String& source);
     String getKeySource();
     void setWriteMode(const String& mode);
+    void stopWriteMode();  // Stop write mode and clear all secrets
+    bool checkWriteTimeout();  // Check if write mode has timed out
     String getWriteMode();
     void setWriteActive(bool active);
     bool isWriteActive();

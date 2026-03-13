@@ -493,6 +493,28 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                 addLog('WebSocket error: ' + error, 'error');
             };
         }
+        
+        // Clean up on page leave (timeout & page change protection)
+        function notifyPageLeave() {
+            try {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'page_leave', timestamp: Date.now() }));
+                }
+                // Also call API for redundancy
+                navigator.sendBeacon('/api/write/stop');
+            } catch (e) {
+                console.log('Page leave notification failed:', e);
+            }
+        }
+        
+        // Handle page leave events
+        window.addEventListener('beforeunload', notifyPageLeave);
+        window.addEventListener('pagehide', notifyPageLeave); // For mobile browsers
+        window.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                notifyPageLeave();
+            }
+        });
 
         // Handle WebSocket messages
         function handleWebSocketMessage(data) {

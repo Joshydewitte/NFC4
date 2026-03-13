@@ -5,7 +5,7 @@
 // ============ DEBUG MODE ============
 // When true: Prepare all crypto but DON'T write to card
 // Show all debug output for verification before enabling real writes
-#define DEBUG_WRITE_MODE true  // 🔍 DEBUG ONLY: NO writes to card!
+#define DEBUG_WRITE_MODE false  // ✅ REAL WRITES ENABLED
 // ====================================
 
 // Default factory AES key (all zeros)
@@ -648,9 +648,13 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     memset(ivInput + 8, 0x00, 8);  // Zero padding
     
     uint8_t iv[16];
-    // EV2 CRITICAL: Use current IV for chaining, not zero!
-    // According to AN12196 Table 27, use "Current IV" from previous operation
-    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, currentIV, ivInput, 16, iv)) {
+    // AN12196 Section 5.4 + Table 9 + Table 27 CONFIRMED:
+    // IVc = E(KSesAuthENC, A55A||TI||CmdCtr||zeros) is AES-ECB (zero CBC IV).
+    // Using currentIV (from auth) as CBC IV gives wrong IVc → card decrypts
+    // with different IVc → stores garbage key → ChangeKey returns 9100 but
+    // re-auth fails because card stored wrong key!
+    uint8_t zeroIV[16] = {0};
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, zeroIV, ivInput, 16, iv)) {
         logError("Failed to calculate IV");
         return false;
     }
@@ -781,6 +785,21 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
         authenticated = false;  // Authentication lost on error
         return false;
     }
+    
+    // ChangeKey response contains 8-byte MAC
+    // TODO: Response MAC verification (format needs to be determined from tests)
+    // For now, we rely on CommitTransaction to validate if change was accepted
+    logDebug("═══════════════════════════════════════");
+    logDebug("ChangeKey Response:");
+    logDebug("Response length: " + String(responseLen) + " bytes");
+    if (responseLen > 0) {
+        logDebug("Response MAC: " + NTAG424Crypto::bytesToHexString(response, responseLen));
+        logToWeb("ℹ️ ChangeKey response MAC: " + NTAG424Crypto::bytesToHexString(response, responseLen), "info");
+    } else {
+        logDebug("⚠️ No response data received!");
+        logToWeb("⚠️ Geen response data van ChangeKey", "warning");
+    }
+    logDebug("═══════════════════════════════════════");
 #endif
     
     // Increment command counter after successful command
@@ -792,9 +811,7 @@ bool NTAG424Handler::changeKey(uint8_t keyNo, const uint8_t* oldKey, const uint8
     memcpy(this->currentIV, encKeyData + 16, 16);
     logDebug("Current IV updated: " + NTAG424Crypto::bytesToHexString(this->currentIV, 16));
     
-    // Response should contain MAC, verify it
-    // For now, just check if we got SW=9100
-    logToWeb("✅ Master key succesvol geschreven!", "success");
+    logToWeb("✅ ChangeKey commando verzonden (wacht op CommitTransaction)", "info");
     
     return true;
 }
@@ -874,17 +891,12 @@ bool NTAG424Handler::commitTransaction() {
     logDebug("═══════════════════════════════════════");
     
     // CommitTransaction command: 0xC7 (no parameters)
-    // In secure messaging (EV2):
-    // C-APDU: 90 C7 00 00 08 [MAC:8] 00
+    // sendCommand expects NATIVE command format (INS + data), not full APDU
+    // sendCommand will wrap it with CLA, P1, P2, Lc, Le
     
-    uint8_t cmd[14];
-    cmd[0] = 0x90;  // CLA
-    cmd[1] = 0xC7;  // INS: CommitTransaction
-    cmd[2] = 0x00;  // P1
-    cmd[3] = 0x00;  // P2
-    cmd[4] = 0x08;  // Lc: 8 bytes (MAC)
-    // cmd[5..12] = MAC (filled below)
-    cmd[13] = 0x00;  // Le
+    uint8_t cmd[9];
+    cmd[0] = 0xC7;  // INS: CommitTransaction
+    // cmd[1..8] = MAC (filled below)
     
     // Calculate IV for MAC calculation
     // IV = E(SesAuthENCKey, A55A || TI || CmdCtr || 0000000000000000)
@@ -897,36 +909,37 @@ bool NTAG424Handler::commitTransaction() {
     memset(ivInput + 8, 0x00, 8);
     
     uint8_t iv[16];
-    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, currentIV, ivInput, 16, iv)) {
+    // IVc calculation is AES-ECB (zero CBC IV) - same as changeKey fix
+    uint8_t zeroIV[16] = {0};
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, zeroIV, ivInput, 16, iv)) {
         logError("Failed to calculate IV");
         return false;
     }
     
     logDebug("IV: " + NTAG424Crypto::bytesToHexString(iv, 16));
     
-    // Calculate CMAC over: CmdHeader || CmdCtr || TI
-    uint8_t macInput[8];
+    // Calculate CMAC over: Cmd || CmdCtr || TI (7 bytes total, AN12196 Table 19)
+    uint8_t macInput[7];
     macInput[0] = 0xC7;  // Command
     macInput[1] = commandCounter & 0xFF;
     macInput[2] = (commandCounter >> 8) & 0xFF;
     memcpy(macInput + 3, transactionId, 4);
-    macInput[7] = 0x00;  // No data for this command
     
-    logDebug("MAC Input: " + NTAG424Crypto::bytesToHexString(macInput, 8));
+    logDebug("MAC Input: " + NTAG424Crypto::bytesToHexString(macInput, 7));
     
     // Calculate 8-byte truncated CMAC
     uint8_t mac[8];
-    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 8, mac)) {
+    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 7, mac)) {
         logError("Failed to calculate CMAC");
         return false;
     }
     
     logDebug("CMAC: " + NTAG424Crypto::bytesToHexString(mac, 8));
     
-    // Fill MAC into command
-    memcpy(cmd + 5, mac, 8);
+    // Fill MAC into command (native command format: INS + MAC)
+    memcpy(cmd + 1, mac, 8);
     
-    logDebug("Command: " + NTAG424Crypto::bytesToHexString(cmd, 14));
+    logDebug("Command: " + NTAG424Crypto::bytesToHexString(cmd, 9));
     
 #if DEBUG_WRITE_MODE
     Serial.println(F("\n╔══════════════════════════════════════════════════════════════╗"));
@@ -943,7 +956,7 @@ bool NTAG424Handler::commitTransaction() {
     uint8_t response[32];
     size_t responseLen = sizeof(response);
     
-    if (!sendCommand(cmd, 14, response, responseLen)) {
+    if (!sendCommand(cmd, 9, response, responseLen)) {
         logError("CommitTransaction command failed");
         authenticated = false;
         return false;

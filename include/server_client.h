@@ -75,20 +75,18 @@ public:
         bool success = (httpCode == 200);
         serverOnline = success;
         http.end();
+        lastPing = millis();  // reset timer regardless of result
         
         Serial.print(F("Server test result: "));
         Serial.println(success ? "✅ OK" : "❌ FAILED");
-        
-        // Don't log every ping to avoid spam
         
         return success;
     }
     
     void periodicPing() {
         unsigned long now = millis();
-        if (now - lastPing >= PING_INTERVAL) {
-            lastPing = now;
-            testConnection();
+        if (lastPing == 0 || now - lastPing >= PING_INTERVAL) {
+            testConnection();  // testConnection() sets lastPing internally
         }
     }
     
@@ -141,7 +139,6 @@ public:
     // Request initial challenge (no UID required) - for pre-caching
     struct ChallengeData {
         String challenge;
-        String challengeId;
         bool success;
     };
     
@@ -156,8 +153,8 @@ public:
         
         Serial.println(F("📤 Requesting initial challenge..."));
         
-        // Server API: GET /api/challenge/initial
-        http.begin(serverUrl + "/api/challenge/initial");
+        // Server API: GET /api/challenge/initial?readerId=<MAC>
+        http.begin(serverUrl + "/api/challenge/initial?readerId=" + WiFi.macAddress());
         http.setTimeout(5000);
         
         int httpCode = http.GET();
@@ -168,14 +165,11 @@ public:
             StaticJsonDocument<512> responseDoc;
             DeserializationError error = deserializeJson(responseDoc, response);
             
-            if (!error && responseDoc.containsKey("challenge") && responseDoc.containsKey("challengeId")) {
+            if (!error && responseDoc.containsKey("challenge")) {
                 result.challenge = responseDoc["challenge"].as<String>();
-                result.challengeId = responseDoc["challengeId"].as<String>();
                 result.success = true;
                 
                 Serial.println(F("✅ Initial challenge received"));
-                Serial.print(F("   Challenge ID: "));
-                Serial.println(result.challengeId);
                 Serial.print(F("   Challenge: "));
                 Serial.println(result.challenge);
             } else {
@@ -190,6 +184,58 @@ public:
         return result;
     }
     
+    // Step 1 of scan flow: link nonce to UID, get derived key back
+    struct StartScanResult {
+        bool success;
+        bool cardKnown;
+        String derivedKeyHex;  // 32 hex chars = K0 for this card
+    };
+
+    StartScanResult startScan(const String& uid) {
+        StartScanResult result;
+        result.success = false;
+        result.cardKnown = false;
+
+        if (serverUrl.isEmpty()) {
+            Serial.println(F("❌ No server configured"));
+            return result;
+        }
+
+        StaticJsonDocument<256> requestDoc;
+        requestDoc["uid"] = uid;
+        requestDoc["readerId"] = WiFi.macAddress();
+        String requestBody;
+        serializeJson(requestDoc, requestBody);
+
+        http.begin(serverUrl + "/api/scan/start");
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(5000);
+
+        int httpCode = http.POST(requestBody);
+
+        if (httpCode == 200) {
+            String responseStr = http.getString();
+            StaticJsonDocument<512> responseDoc;
+            if (!deserializeJson(responseDoc, responseStr)) {
+                result.success = true;
+                result.cardKnown = responseDoc["cardKnown"] | false;
+                result.derivedKeyHex = responseDoc["derivedKey"].as<String>();
+                Serial.print(F("✅ Scan start OK, known: "));
+                Serial.println(result.cardKnown ? "yes" : "no");
+            }
+        } else if (httpCode == 404) {
+            result.success = true;   // not an error - card just not registered
+            result.cardKnown = false;
+            Serial.println(F("   Card not registered on server"));
+        } else {
+            Serial.print(F("❌ scan/start failed: HTTP "));
+            Serial.println(httpCode);
+        }
+
+        http.end();
+        return result;
+    }
+
     // Send scan with crypto proof, receive result + next challenge
     struct ScanResult {
         bool success;
@@ -197,12 +243,10 @@ public:
         int credits;
         String message;
         String nextChallenge;   // For next card scan
-        String nextChallengeId; // ID for next challenge
     };
     
     ScanResult scanWithProof(const String& cardUID, const String& encRndB, 
-                             const String& encResponse, const String& transactionId,
-                             const String& challengeId) {
+                             const String& encResponse, const String& transactionId) {
         ScanResult result;
         result.success = false;
         result.credits = 0;
@@ -218,13 +262,13 @@ public:
         logToWeb("📤 Scan met crypto proof verzenden...", "info");
         
         // Server API: POST /api/scan-with-proof
-        // Body: { uid, encRndB, encResponse, transactionId, challengeId }
+        // Body: { uid, encRndB, encResponse, transactionId, readerId }
         StaticJsonDocument<1024> requestDoc;
         requestDoc["uid"] = cardUID;
         requestDoc["encRndB"] = encRndB;
         requestDoc["encResponse"] = encResponse;
         requestDoc["transactionId"] = transactionId;
-        requestDoc["challengeId"] = challengeId;
+        requestDoc["readerId"] = WiFi.macAddress();
         
         String requestBody;
         serializeJson(requestDoc, requestBody);
@@ -247,7 +291,6 @@ public:
                 result.credits = responseDoc["credits"] | 0;
                 result.message = responseDoc["message"].as<String>();
                 result.nextChallenge = responseDoc["nextChallenge"].as<String>();
-                result.nextChallengeId = responseDoc["nextChallengeId"].as<String>();
                 
                 Serial.print(F("✅ Scan result: "));
                 Serial.println(result.status);
@@ -255,8 +298,6 @@ public:
                 Serial.println(result.credits);
                 Serial.print(F("   Message: "));
                 Serial.println(result.message);
-                Serial.print(F("   Next challenge ID: "));
-                Serial.println(result.nextChallengeId);
                 Serial.print(F("   Next challenge: "));
                 Serial.println(result.nextChallenge);
                 
@@ -568,27 +609,47 @@ public:
     
     // ============ CARD SCAN LOGGING ============
     
-    bool sendScan(const String& cardUID, const String& cardStatus) {
+    bool sendScan(const String& cardUID, const String& cardStatus, const String& cardType = "") {
         if (serverUrl.isEmpty()) {
             Serial.println(F("No server configured - scan not logged"));
             return false;
         }
         
-        // Determine isPersonalized boolean from string status
+        // Determine status from cardType and cardStatus
+        String scanStatus = "unknown";
         bool isPersonalized = false;
-        if (cardStatus == "personalized" || cardStatus == "gedoopt") {
-            isPersonalized = true;
-        } else if (cardStatus == "factory") {
+        
+        // Check if it's a non-NTAG424 card
+        if (cardType.length() > 0 && 
+            cardType.indexOf("NTAG424") < 0 && 
+            cardType.indexOf("DESFire") < 0 &&
+            cardType.indexOf("SECURE") < 0) {
+            scanStatus = "non_ntag424";
             isPersonalized = false;
+        } else {
+            // NTAG424 card - use cardStatus
+            if (cardStatus == "personalized" || cardStatus == "gedoopt") {
+                isPersonalized = true;
+                scanStatus = "known";
+            } else if (cardStatus == "factory") {
+                isPersonalized = false;
+                scanStatus = "factory";
+            } else if (cardStatus == "unknown") {
+                isPersonalized = false;
+                scanStatus = "challenge_failed";
+            }
         }
-        // For "unknown", leave as false
         
         // Server API: POST /api/scan
-        // Expected: { uid, readerName, isPersonalized }
+        // Expected: { uid, readerName, isPersonalized, status, cardType }
         StaticJsonDocument<512> requestDoc;
         requestDoc["uid"] = cardUID;
         requestDoc["readerName"] = WiFi.macAddress(); // Use MAC as reader identifier
         requestDoc["isPersonalized"] = isPersonalized;
+        requestDoc["status"] = scanStatus;
+        if (cardType.length() > 0) {
+            requestDoc["cardType"] = cardType;
+        }
         
         String requestBody;
         serializeJson(requestDoc, requestBody);
@@ -597,9 +658,9 @@ public:
         Serial.print(F("   UID: "));
         Serial.println(cardUID);
         Serial.print(F("   Status: "));
-        Serial.println(cardStatus);
-        Serial.print(F("   isPersonalized: "));
-        Serial.println(isPersonalized ? "true" : "false");
+        Serial.println(scanStatus);
+        Serial.print(F("   Card Type: "));
+        Serial.println(cardType.length() > 0 ? cardType : "NTAG424");
         
         http.begin(serverUrl + "/api/scan");
         http.addHeader("Content-Type", "application/json");
