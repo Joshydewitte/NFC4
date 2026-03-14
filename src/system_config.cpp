@@ -381,6 +381,71 @@ String SystemConfig::getNdefWriteMode() {
     return v;
 }
 
+// ============ READER REGISTRATION ============
+
+/**
+ * Derive a stable reader ID from the WiFi MAC address.
+ * Uses SHA-256("NFC-READER-ID:" + MAC_HEX) and takes the first 8 bytes (16 hex chars).
+ * Result is cached in NVS so it survives restarts even if WiFi is not yet active.
+ */
+String SystemConfig::deriveReaderId() {
+    // Return cached value if available
+    prefs.begin("system", true);
+    String cached = prefs.getString("reader_id", "");
+    prefs.end();
+    if (cached.length() == 16) return cached;
+
+    // Build input: "NFC-READER-ID:" + MAC (no colons, e.g. "AABBCCDDEEFF")
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    String input = "NFC-READER-ID:" + mac;
+
+    // SHA-256
+    uint8_t hash[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, (const uint8_t*)input.c_str(), input.length());
+    mbedtls_md_finish(&ctx, hash);
+    mbedtls_md_free(&ctx);
+
+    // Take first 8 bytes → 16 uppercase hex chars
+    String id = "";
+    for (int i = 0; i < 8; i++) {
+        char hex[3];
+        sprintf(hex, "%02X", hash[i]);
+        id += hex;
+    }
+
+    // Cache in NVS
+    prefs.begin("system", false);
+    prefs.putString("reader_id", id);
+    prefs.end();
+
+    Serial.print(F("📡 Reader ID derived: "));
+    Serial.println(id);
+    return id;
+}
+
+void SystemConfig::setReaderToken(const String& token) {
+    prefs.begin("system", false);
+    prefs.putString("reader_token", token);
+    prefs.end();
+    Serial.println(F("✅ Reader token opgeslagen"));
+}
+
+String SystemConfig::getReaderToken() {
+    prefs.begin("system", true);
+    String token = prefs.getString("reader_token", "");
+    prefs.end();
+    return token;
+}
+
+bool SystemConfig::hasReaderToken() {
+    return getReaderToken().length() > 0;
+}
+
 // ============ RESET FUNCTIONS ============
 
 void SystemConfig::resetNetwork() {

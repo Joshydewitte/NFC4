@@ -186,7 +186,39 @@ private:
                           (en ? "true" : "false") + ",\"writeMode\":\"" + mode + "\"}";
             httpServer.send(200, "application/json", json);
         });
-        
+
+        // Reader info: ID + whether token is configured
+        httpServer.on("/api/reader/info", HTTP_GET, [this]() {
+            if (!requireAuth()) return;
+            String rid  = config->deriveReaderId();
+            String mac  = WiFi.macAddress();
+            bool   hasTok = config->hasReaderToken();
+            String json = "{\"readerId\":\"" + rid + "\",\"mac\":\"" + mac + "\",\"hasToken\":" +
+                          (hasTok ? "true" : "false") + "}";
+            httpServer.send(200, "application/json", json);
+        });
+
+        // Save reader API token
+        httpServer.on("/api/settings/reader-token", HTTP_POST, [this]() {
+            if (!requireAuth()) return;
+            String body = httpServer.arg("plain");
+            JsonDocument doc;
+            if (deserializeJson(doc, body) || !doc["token"].is<const char*>()) {
+                httpServer.send(400, "application/json", "{\"error\":\"Missing token\"}");
+                return;
+            }
+            String token = doc["token"].as<String>();
+            if (token.length() == 0) {
+                httpServer.send(400, "application/json", "{\"error\":\"Token cannot be empty\"}");
+                return;
+            }
+            config->setReaderToken(token);
+            if (serverClient) {
+                serverClient->setReaderToken(token);
+            }
+            httpServer.send(200, "application/json", "{\"success\":true}");
+        });
+
         // System control APIs
         httpServer.on("/api/reboot", HTTP_POST, [this]() {
             if (!requireAuth()) return;

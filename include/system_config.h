@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <mbedtls/md.h>
+#include <WiFi.h>
 
 class SystemConfig {
 private:
@@ -98,6 +99,14 @@ public:
       // writeMode: "keys_and_ndef" | "keys_only" | "ndef_only"
       void setNdefWriteMode(const String& mode);
       String getNdefWriteMode();
+
+      // ============ READER REGISTRATION ============
+      // Reader ID: derived once from MAC address using SHA-256, stored in NVS.
+      // Reader Token: API token obtained from the server after registration.
+      String deriveReaderId();   // compute/cache SHA-256 based ID
+      void setReaderToken(const String& token);
+      String getReaderToken();
+      bool hasReaderToken();
 
       // ============ RESET FUNCTIONS ============
     void resetNetwork();

@@ -167,6 +167,10 @@ private:
     NFCWebServer* webServer;
     bool isoDEPActive;  // Track if ISO-DEP session is active
     uint16_t lastStatusWord;  // Last status word from card
+    String lastError;           // Last low-level error from transceive
+public:
+    String getLastError() const { return lastError; }
+private:
     
     // Secure messaging state (valid after successful authentication)
     bool authenticated;

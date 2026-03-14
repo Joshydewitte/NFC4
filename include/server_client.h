@@ -15,6 +15,8 @@ private:
     unsigned long lastPing = 0;
     const unsigned long PING_INTERVAL = 30000; // 30 seconden
     NFCWebServer* webServer = nullptr;
+    String readerId  = "";   // SHA-256 derived from MAC, set at startup
+    String readerToken = ""; // API token from server after registration
     
 public:
     ServerClient() {}
@@ -22,12 +24,34 @@ public:
     void setWebServer(NFCWebServer* ws) {
         webServer = ws;
     }
+
+    void setReaderId(const String& id) {
+        readerId = id;
+    }
+
+    void setReaderToken(const String& token) {
+        readerToken = token;
+    }
+
+    String getReaderId() const {
+        return readerId.length() > 0 ? readerId : WiFi.macAddress();
+    }
     
     void logToWeb(const String& message, const String& level = "info") {
         if (webServer != nullptr) {
             // Forward declare the method we'll call
             extern void webServerBroadcastLog(NFCWebServer* ws, const String& msg, const String& lvl);
             webServerBroadcastLog(webServer, message, level);
+        }
+    }
+
+    // Add reader authentication headers when a token is configured
+    void addReaderAuthHeaders() {
+        if (readerId.length() > 0) {
+            http.addHeader("X-Reader-Id", readerId);
+        }
+        if (readerToken.length() > 0) {
+            http.addHeader("X-Reader-Token", readerToken);
         }
     }
     
@@ -65,12 +89,13 @@ public:
 
         String url = serverUrl + "/api/ping";
         if (requestChallenge) {
-            url += "?readerId=" + WiFi.macAddress() + "&renew=1";
+            url += "?readerId=" + getReaderId() + "&renew=1";
         }
 
         http.begin(url);
         http.setTimeout(3000);   // tight — this is just a heartbeat
         http.addHeader("User-Agent", "ESP32-NFC-Reader");
+        addReaderAuthHeaders();
 
         int httpCode = http.GET();
         lastPing = millis();
@@ -194,8 +219,8 @@ public:
         
         Serial.println(F("📤 Requesting initial challenge..."));
         
-        // Server API: GET /api/challenge/initial?readerId=<MAC>
-        http.begin(serverUrl + "/api/challenge/initial?readerId=" + WiFi.macAddress());
+        // Server API: GET /api/challenge/initial?readerId=<readerId>
+        http.begin(serverUrl + "/api/challenge/initial?readerId=" + getReaderId());
         http.setTimeout(5000);
         
         int httpCode = http.GET();
@@ -247,13 +272,14 @@ public:
 
         StaticJsonDocument<256> requestDoc;
         requestDoc["uid"] = uid;
-        requestDoc["readerId"] = WiFi.macAddress();
+        requestDoc["readerId"] = getReaderId();
         String requestBody;
         serializeJson(requestDoc, requestBody);
 
         http.begin(serverUrl + "/api/scan/start");
         http.addHeader("Content-Type", "application/json");
         http.setTimeout(5000);
+        addReaderAuthHeaders();
 
         int httpCode = http.POST(requestBody);
 
@@ -321,7 +347,7 @@ public:
         requestDoc["encRndB"] = encRndB;
         requestDoc["encResponse"] = encResponse;
         requestDoc["transactionId"] = transactionId;
-        requestDoc["readerId"] = WiFi.macAddress();
+        requestDoc["readerId"] = getReaderId();
         
         String requestBody;
         serializeJson(requestDoc, requestBody);
@@ -329,6 +355,7 @@ public:
         http.begin(serverUrl + "/api/scan-with-proof");
         http.addHeader("Content-Type", "application/json");
         http.setTimeout(5000);
+        addReaderAuthHeaders();
         
         int httpCode = http.POST(requestBody);
         
@@ -658,7 +685,7 @@ public:
         }
         
         StaticJsonDocument<512> requestDoc;
-        requestDoc["reader_id"] = WiFi.macAddress();
+        requestDoc["reader_id"] = getReaderId();
         requestDoc["status"] = status;
         requestDoc["message"] = message;
         requestDoc["timestamp"] = millis();
@@ -712,6 +739,15 @@ public:
             } else if (cardStatus == "unknown") {
                 isPersonalized = false;
                 scanStatus = "challenge_failed";
+            } else if (cardStatus == "empty_response") {
+                isPersonalized = false;
+                scanStatus = "empty_response";
+            } else if (cardStatus == "timeout") {
+                isPersonalized = false;
+                scanStatus = "timeout";
+            } else if (cardStatus == "rf_error") {
+                isPersonalized = false;
+                scanStatus = "rf_error";
             }
         }
         
@@ -719,8 +755,8 @@ public:
         // Expected: { uid, readerId, readerName, isPersonalized, status, cardType }
         StaticJsonDocument<512> requestDoc;
         requestDoc["uid"] = cardUID;
-        requestDoc["readerId"]   = WiFi.macAddress();
-        requestDoc["readerName"] = WiFi.macAddress();
+        requestDoc["readerId"]   = getReaderId();
+        requestDoc["readerName"] = getReaderId();
         requestDoc["isPersonalized"] = isPersonalized;
         requestDoc["status"] = scanStatus;
         if (cardType.length() > 0) {
@@ -741,6 +777,7 @@ public:
         http.begin(serverUrl + "/api/scan");
         http.addHeader("Content-Type", "application/json");
         http.setTimeout(5000);
+        addReaderAuthHeaders();
         
         int httpCode = http.POST(requestBody);
         

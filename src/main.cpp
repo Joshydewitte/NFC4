@@ -126,6 +126,20 @@ void setup() {
       Serial.print(F("Server configured: "));
       Serial.println(serverUrl);
     }
+
+    // Derive reader ID from MAC (cached in NVS) and load token
+    Serial.println(F("\n=== Reader Identity ==="));
+    String readerId = systemConfig.deriveReaderId();
+    serverClient.setReaderId(readerId);
+    Serial.print(F("Reader ID: "));
+    Serial.println(readerId);
+    String readerToken = systemConfig.getReaderToken();
+    if (readerToken.length() > 0) {
+      serverClient.setReaderToken(readerToken);
+      Serial.println(F("✅ Reader token geladen"));
+    } else {
+      Serial.println(F("⚠️  Geen reader token — registreer via Instellingen"));
+    }
     
     // Start web server
     Serial.println(F("\n=== Web Server ==="));
@@ -599,7 +613,20 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
         NTAG424Handler::AuthResult cryptoResult;
         bool cryptoAuth = ntag424Handler->authenticateEV2First(0, derivedKey, cachedChallenge, cryptoResult);
 
-        if (cryptoAuth) {
+        const String lastErr = ntag424Handler->getLastError();
+        if (lastErr == "timeout") {
+          cardStatus = "timeout";
+          Serial.println(F("   ⏱️ Timeout kaart antwoord"));
+          webServer.broadcastLog("⏱️ Kaart reageert niet (timeout)", "warning");
+        } else if (lastErr == "rf_error") {
+          cardStatus = "rf_error";
+          Serial.println(F("   📡 RF Fout tijdens communicatie"));
+          webServer.broadcastLog("📡 RF fout tijdens kaart communicatie", "warning");
+        } else if (lastErr == "empty_response") {
+          cardStatus = "empty_response";
+          Serial.println(F("   ⚠️ Empty response van kaart"));
+          webServer.broadcastLog("⚠️ Kaart reageert niet (leeg antwoord)", "warning");
+        } else if (cryptoAuth) {
           cardStatus = "personalized";
           Serial.println(F("   ✅ Auth OK → PERSONALIZED"));
           webServer.broadcastLog("✅ Gepersonaliseerde kaart", "success");

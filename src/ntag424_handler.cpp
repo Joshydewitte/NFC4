@@ -1271,58 +1271,74 @@ bool NTAG424Handler::transceive(const uint8_t* cmd, size_t cmdLen,
     size_t isoCmdLen = cmdLen + 1;
     
     logDebug("Sending " + String(isoCmdLen) + " bytes...");
-    
-    // Clear any pending IRQ status
-    nfc->clearIRQStatus(0xFFFFFFFF);
-    delay(5);
-    
-    // Send command to card
-    if (!nfc->sendData(isoCmd, isoCmdLen)) {
-        logError("Failed to send command to card");
-        return false;
-    }
-    
-    // Wait for response (with timeout)
-    unsigned long startTime = millis();
-    const unsigned long timeout = 500; // 500ms timeout for NTAG424 crypto operations
-    
-    uint32_t irqStatus = 0;
-    while (millis() - startTime < timeout) {
-        irqStatus = nfc->getIRQStatus();
-        
-        // Check for RX complete
-        if (irqStatus & RX_IRQ_STAT) {
-            break;
+
+    const int MAX_RETRIES = 5;
+    const unsigned long RETRY_DELAY_MS = 50;
+    uint16_t rxLen = 0;
+
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+            logDebug("Empty response — retry " + String(attempt) + "/" + String(MAX_RETRIES - 1));
+            delay(RETRY_DELAY_MS);
         }
-        
-        // Check for errors
-        if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-            logError("General error during transceive");
+
+        // Clear any pending IRQ status
+        nfc->clearIRQStatus(0xFFFFFFFF);
+        delay(5);
+
+        // Send command to card
+        if (!nfc->sendData(isoCmd, isoCmdLen)) {
+            logError("Failed to send command to card");
+            return false;
+        }
+
+        // Wait for response (with timeout)
+        unsigned long startTime = millis();
+        const unsigned long timeout = 500; // 500ms timeout for NTAG424 crypto operations
+
+        uint32_t irqStatus = 0;
+        while (millis() - startTime < timeout) {
+            irqStatus = nfc->getIRQStatus();
+
+            if (irqStatus & RX_IRQ_STAT) {
+                break;
+            }
+
+            if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
+                lastError = "rf_error";
+                logError("General error during transceive");
+                logDebug("IRQ Status: 0x" + String(irqStatus, HEX));
+                return false;
+            }
+
+            delay(2);
+        }
+
+        if (!(irqStatus & RX_IRQ_STAT)) {
+            lastError = "timeout";
+            logError("❌ Timeout waiting for card response");
             logDebug("IRQ Status: 0x" + String(irqStatus, HEX));
             return false;
         }
-        
-        delay(2);
+
+        // Get actual received length from RX_STATUS register
+        uint32_t rxStatus;
+        if (!nfc->readRegister(RX_STATUS, &rxStatus)) {
+            logError("Failed to read RX status");
+            return false;
+        }
+
+        rxLen = (rxStatus >> 0) & 0x1FF; // Bits 0-8 contain RX bytes
+        logDebug("Received " + String(rxLen) + " bytes");
+
+        if (rxLen >= 1) {
+            break; // got a valid response
+        }
     }
-    
-    if (!(irqStatus & RX_IRQ_STAT)) {
-        logError("❌ Timeout waiting for card response");
-        logDebug("IRQ Status: 0x" + String(irqStatus, HEX));
-        return false;
-    }
-    
-    // Get actual received length from RX_STATUS register
-    uint32_t rxStatus;
-    if (!nfc->readRegister(RX_STATUS, &rxStatus)) {
-        logError("Failed to read RX status");
-        return false;
-    }
-    
-    uint16_t rxLen = (rxStatus >> 0) & 0x1FF; // Bits 0-8 contain RX bytes
-    logDebug("Received " + String(rxLen) + " bytes");
-    
+
     if (rxLen < 1) {
-        logError("Empty response from card");
+        lastError = "empty_response";
+        logError("Empty response from card after retries");
         return false;
     }
     

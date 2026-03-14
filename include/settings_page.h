@@ -166,7 +166,6 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
 
     <div class="card">
         <h2>Server Instellingen</h2>
-        <div class="form-group">
             <label for="serverUrl">Server URL (inclusief http:// en poort)</label>
             <input type="text" id="serverUrl" placeholder="http://192.168.10.7:3000" value="%SERVER_URL%">
             <small style="color: #666; display: block; margin-top: 5px;">
@@ -182,6 +181,26 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
         </div>
         <button onclick="saveServerSettings()">💾 Server Opslaan</button>
         <button onclick="testServer()" style="margin-left: 10px;">🔄 Test Verbinding</button>
+    </div>
+
+    <div class="card">
+        <h2>📡 Reader Registratie</h2>
+        <div class="info-box">
+            Registreer deze reader op de server zodat alleen gemachtigde readers kaarten kunnen scannen.<br>
+            Gebruik de Reader ID hieronder op de Server Instellingen pagina om de reader aan te melden.
+            Voer daarna het verkregen API-token hier in.
+        </div>
+        <div class="form-group">
+            <label>Reader ID (Voer dit in op de server)</label>
+            <div style="font-family: monospace; font-size: 1.1em; background: #f0f4ff; border: 2px solid #667eea; padding: 12px; border-radius: 8px; letter-spacing: 2px; color: #333;" id="readerIdDisplay">Laden...</div>
+            <small style="color: #888; display: block; margin-top: 5px;">MAC: <span id="readerMacDisplay">...</span></small>
+        </div>
+        <div class="form-group">
+            <label for="readerApiToken">API Token (van de server na registratie)</label>
+            <input type="text" id="readerApiToken" placeholder="Na registratie op server invullen" maxlength="64">
+        </div>
+        <div id="readerTokenStatus" style="margin-bottom: 10px;"></div>
+        <button onclick="saveReaderToken()">💾 Token Opslaan</button>
     </div>
 
     <div class="card">
@@ -487,6 +506,50 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
             .then(() => location.href = '/login');
         }
 
+        function loadReaderInfo() {
+            fetch('/api/reader/info', { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('readerIdDisplay').textContent = data.readerId || 'Niet beschikbaar';
+                document.getElementById('readerMacDisplay').textContent = data.mac || '';
+                const statusEl = document.getElementById('readerTokenStatus');
+                if (data.hasToken) {
+                    statusEl.innerHTML = '<span style="color:#4caf50;">✅ Token geconfigureerd — reader is geregistreerd</span>';
+                    document.getElementById('readerApiToken').placeholder = '(token al opgeslagen)';
+                } else {
+                    statusEl.innerHTML = '<span style="color:#f57c00;">⚠️ Geen token — registreer deze reader op de server</span>';
+                }
+            })
+            .catch(() => {
+                document.getElementById('readerIdDisplay').textContent = 'Fout bij laden';
+            });
+        }
+
+        function saveReaderToken() {
+            const token = document.getElementById('readerApiToken').value.trim();
+            if (!token) {
+                showMessage('❌ Voer een API token in', true);
+                return;
+            }
+            fetch('/api/settings/reader-token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ token: token })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showMessage('✅ Reader token opgeslagen — herstart aanbevolen');
+                    loadReaderInfo();
+                    document.getElementById('readerApiToken').value = '';
+                } else {
+                    showMessage('❌ Opslaan mislukt', true);
+                }
+            })
+            .catch(e => showMessage('❌ Fout: ' + e, true));
+        }
+
         function loadNdefSettings() {
             fetch('/api/settings/ndef', { credentials: 'same-origin' })
             .then(r => r.json())
@@ -511,8 +574,9 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
             .catch(e => showMessage('❌ Fout: ' + e, true));
         }
 
-        // Load NDEF settings on page load
+        // Load settings on page load
         loadNdefSettings();
+        loadReaderInfo();
     </script>
 </body>
 </html>
