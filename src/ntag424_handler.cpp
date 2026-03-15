@@ -1,4 +1,4 @@
-#include "ntag424_handler.h"
+﻿#include "ntag424_handler.h"
 #include "web_server.h"
 #include <PN5180.h>
 
@@ -16,6 +16,7 @@ const uint8_t NTAG424Handler::DEFAULT_AES_KEY[16] = {
 
 NTAG424Handler::NTAG424Handler(PN5180ISO14443* nfcReader)
     : nfc(nfcReader), webServer(nullptr), isoDEPActive(false), lastStatusWord(0x0000),
+      lastError(""), isoBlockNumber(0),
       authenticated(false), commandCounter(0) {
     memset(transactionId, 0, 4);
     memset(sessionEncKey, 0, 16);
@@ -60,7 +61,7 @@ bool NTAG424Handler::activateCard() {
     
     // Clear IRQ status before sending
     nfc->clearIRQStatus(0xFFFFFFFF);
-    delay(5);
+    delay(1);
     
     // Send RATS command
     if (!nfc->sendData(rats, 2)) {
@@ -87,7 +88,7 @@ bool NTAG424Handler::activateCard() {
             return false;
         }
         
-        delay(2);
+        delayMicroseconds(500);
     }
     
     if (!(irqStatus & RX_IRQ_STAT)) {
@@ -170,6 +171,8 @@ void NTAG424Handler::resetSession() {
     authenticated = false;
     authenticatedKeyNo = 0xFF;  // Invalid key number
     commandCounter = 0;
+    isoBlockNumber = 0;         // Reset ISO-DEP block toggle for new card
+    lastError = "";             // Clear any stale error from previous scan
     memset(transactionId, 0, 4);
     memset(sessionEncKey, 0, 16);
     memset(sessionMacKey, 0, 16);
@@ -1060,6 +1063,44 @@ bool NTAG424Handler::writeNDEF(const String& url) {
     memcpy(fileBuf + filePos, shortUrl.c_str(), shortLen);
     filePos += shortLen;
 
+    // Append SDM ASCII-hex mirror placeholders to the URL.
+    // With SDMMetaRead=0xE (free access), the card does PLAIN ASCII mirroring:
+    //   UID(7B)=14 chars at UIDOffset, CTR(3B)=6 chars at CTROffset,
+    //   MAC(8B)=16 chars at MACOffset. Three separate offsets in ChangeFileSettings.
+    // Separator '?' if URL has no query string yet, '&' otherwise.
+    const char* sep = (url.indexOf('?') < 0) ? "?sv=" : "&sv=";
+    const uint8_t sepLen      = 4;  // "?sv=" or "&sv="
+    const uint8_t uidLen      = 14; // 7 bytes × 2 hex chars
+    const uint8_t ctrLen      = 6;  // 3 bytes × 2 hex chars
+    const uint8_t macLen      = 16; // 8 bytes × 2 hex chars
+    // NTAG424 uses strict < boundary checks: fieldOffset + fieldLen < nextFieldOffset.
+    // Without gap: 62+14=76 < 76 is FALSE → 0x9E. Add 1-char gap between each field.
+    const uint8_t gapLen      = 1;
+    // Layout: [UID 14][gap 1][CTR 6][gap 1][MAC 16] = 38 chars + 4 trailing = 42 total.
+    // NTAG424 strict < checks: UIDEnd<CTROff, CTREnd<MACOff, MACEnd<NLEN — all need gap.
+    // trailingLen=4 ensures NLEN > MACOffset+16 (strict <).
+    const uint8_t innerLen    = uidLen + gapLen + ctrLen + gapLen + macLen; // 38
+    const uint8_t trailingLen = 4;
+
+    memcpy(fileBuf + filePos, sep, sepLen);
+    filePos += sepLen;
+
+    // Record file offsets: 1-char gap between every field (all strict < checks).
+    sdmUidOffset = (uint16_t)filePos;                        // 62
+    sdmCtrOffset = sdmUidOffset + uidLen + gapLen;           // 62+14+1=77
+    sdmMacOffset = sdmCtrOffset + ctrLen + gapLen;           // 77+6+1=84
+    // Checks: UIDEnd=76 < CTROff=77 ✓, CTREnd=83 < MACOff=84 ✓, MACEnd=100 < NLEN=102 ✓
+
+    memset(fileBuf + filePos, '0', innerLen + trailingLen);
+    filePos += innerLen + trailingLen;
+
+    // Patch NLEN and payload_length to include the SDM suffix + trailer.
+    nlen = (uint16_t)(filePos - 2);      // total NDEF message bytes
+    fileBuf[0] = (uint8_t)((nlen >> 8) & 0xFF);
+    fileBuf[1] = (uint8_t)(nlen & 0xFF);
+    payloadLen  = (uint8_t)(1 + shortLen + sepLen + innerLen + trailingLen);
+    fileBuf[4]  = payloadLen;
+
     // Build WriteData native command (without CLA/P1/P2 - sendCommand adds those):
     //   [INS=0x8D] [FileNo] [Offset(3 LE)] [Length(3 LE)] [FileData]
     uint8_t cmd[1 + 7 + 256];
@@ -1085,9 +1126,245 @@ bool NTAG424Handler::writeNDEF(const String& url) {
         logToWeb("NDEF URL schrijven mislukt", "error");
         return false;
     }
+    // WriteData increments the card's CommandCounter (AN12196 §6.10.1).
+    // Keep the host counter in sync so the next EV2-MAC'd command (SetupSDM) is correct.
+    commandCounter++;
     logDebug("<< NDEF write OK (SW=9100)");
     logToWeb("NDEF URL geschreven", "success");
     return true;
+}
+
+// ── SDM: configure NDEF file for Secure Dynamic Messaging ─────────────────────
+bool NTAG424Handler::setupSDM() {
+    if (!authenticated) {
+        logError("setupSDM requires prior authentication");
+        return false;
+    }
+
+    logDebug("SetupSDM: CmdCtr=" + String(commandCounter)
+           + " TI=" + NTAG424Crypto::bytesToHexString(transactionId, 4));
+
+    // ── EV2-secured GetFileSettings(File02) diagnostic ───────────────────────
+    // In EV2 sessions ALL commands (even Plain CommMode) must carry a CmdMAC.
+    // Sending GFS without MAC returns SW=917E which can desync the card's
+    // commandCounter from ours, causing the next CFS to fail with SW=91AE.
+    //
+    // CmdMAC input: INS(1) || CmdCtr(2LE) || TI(4) || FileNo(1) = 8 bytes
+    {
+        uint8_t gfsMacIn[8];
+        gfsMacIn[0] = 0xF5;
+        gfsMacIn[1] = commandCounter & 0xFF;
+        gfsMacIn[2] = (commandCounter >> 8) & 0xFF;
+        memcpy(gfsMacIn + 3, transactionId, 4);
+        gfsMacIn[7] = 0x02; // FileNo
+
+        uint8_t gfsMac[8];
+        if (NTAG424Crypto::calculateCMAC(sessionMacKey, gfsMacIn, 8, gfsMac)) {
+            // sendCommand uses cmd[0] as APDU INS; data = FileNo(1) + CmdMAC(8)
+            uint8_t gfsCmd[10];
+            gfsCmd[0] = 0xF5;
+            gfsCmd[1] = 0x02;
+            memcpy(gfsCmd + 2, gfsMac, 8);
+
+            uint8_t gfsRsp[32];
+            size_t  gfsLen = sizeof(gfsRsp);
+            if (sendCommand(gfsCmd, 10, gfsRsp, gfsLen)) {
+                // EV2 Plain-CommMode response: FileSettings(7) + RMAC(8)
+                // Byte layout: FileType FileOption AR(2) FileSize(3LE)
+                if (gfsLen >= 7) {
+                    uint32_t fileSize = (uint32_t)gfsRsp[4]
+                                      | ((uint32_t)gfsRsp[5] << 8)
+                                      | ((uint32_t)gfsRsp[6] << 16);
+                    logDebug("GFS File02: comm=0x" + String(gfsRsp[1], HEX)
+                           + " AR=0x" + String(gfsRsp[2],HEX) + String(gfsRsp[3],HEX)
+                           + " size=" + String(fileSize)
+                           + " full=" + NTAG424Crypto::bytesToHexString(gfsRsp, gfsLen));
+                }
+                commandCounter++;
+            } else {
+                logDebug("GFS File02 failed SW=0x" + String(lastStatusWord, HEX));
+            }
+        }
+    }
+
+    //   SDMOptions 0xC2 = 1100 0010  bit7=VCUID, bit6=SDMReadCtr, bit1=ASCII_encoding
+    //   SDMAccessRights byte 0: [7:4]=SDMMetaReadPerm  [3:0]=SDMFileReadPerm
+    //   SDMAccessRights byte 1: [7:4]=SDMMACInputPerm  [3:0]=SDMMACKey
+    //     MetaRead=0xE(free), FileRead=0xF(N/A), MACInput=0xF(N/A), MACKey=0x0(K0)
+    //   Fields present: UIDOffset + CTROffset + SDMMACOffset (no ENC/MACInput offsets)
+    //
+    //   sdmUidOffset / sdmCtrOffset / sdmMacOffset are computed by writeNDEF()
+    //   and stored in instance variables.  In ASCII mode the card writes uppercase
+    //   hex ASCII at those positions:  UID(7B)→14 chars, CTR(3B)→6 chars, MAC(8B)→16 chars.
+    if (sdmUidOffset == 0) {
+        logError("setupSDM: sdmUidOffset==0 — writeNDEF() must be called first to set SDM offsets");
+        return false;
+    }
+
+    // ChangeFileSettings plaintext layout (NT4H2421Gx §10.4, Table 69):
+    //   FileOption(1) + AR(2) + SDMOptions(1) + SDMAcc(2 LE)
+    //   + UIDOffset(3) + CTROff(3) + SDMMACInputOffset(3) + SDMMACOffset(3)
+    //   + ISO7816-pad(0x80 + 0x00*13) = 32 bytes (2 AES blocks)
+    //
+    // SDMAccessRights is a 2-byte LITTLE-ENDIAN field (confirmed via AN12196 §6.9):
+    //   byte[0] = LE-low  = [7:4]=RFU(must=F)   [3:0]=SDMCtrRet
+    //   byte[1] = LE-high = [7:4]=SDMMetaRead    [3:0]=SDMFileRead(=MACKey)
+    //
+    // Our config: MetaRead=E(free plain UID/CTR), FileRead=K0(MAC via K0), CtrRet=F(N/A)
+    //   SDMAcc byte[0]=0xFF (RFU=F, CtrRet=F), byte[1]=0xE0 (MetaRead=E, FileRead=K0)
+    //
+    // Fields present (NT4H2421Gx conditions):
+    //   UIDOffset:          present if (VCUID=1 AND MetaRead=E)  → YES (VCUID&ASCII=0xC1)
+    //   CTROff:             present if (SDMReadCtr=1 AND MetaRead=E) → YES
+    //   SDMMACInputOffset:  present if (FileRead != Fh) → YES (FileRead=K0)
+    //   SDMMACOffset:       present if (FileRead != Fh) → YES
+    //   SDMMACInputOffset = SDMMACOffset = MACOff → empty file-data range → SUN MAC over UID+CTR only
+    //
+    // Overlap checks (ASCII lengths: UID=14, CTR=6, MAC=16):
+    //   CTROff(77) ≥ UIDOff(62)+14=76 ✓,  MACOff(84) ≥ CTROff(77)+6=83 ✓
+    //   MACOff(84) ≥ UIDOff(62)+14=76 ✓,  MACOff(84) ≤ FileSize-16=240 ✓
+    uint8_t plainData[32];
+    memset(plainData, 0, sizeof(plainData));
+    plainData[0]  = 0x40;  // FileOption: SDMEnabled=1, CommMode=Plain
+    plainData[1]  = 0xE0;  // AccessRights[0]: RW=E(free), CAR=0(K0)
+    plainData[2]  = 0xEE;  // AccessRights[1]: W=E(free), R=E(free)
+    plainData[3]  = 0xC1;  // SDMOptions: VCUID(b7)|SDMReadCtr(b6)|ASCII(b0)
+    plainData[4]  = 0xFF;  // SDMAcc LE-low:  RFU=F, SDMCtrRet=F(N/A)
+    plainData[5]  = 0xE0;  // SDMAcc LE-high: SDMMetaRead=E(free), SDMFileRead=0(K0→MACKey)
+    plainData[6]  =  sdmUidOffset       & 0xFF;  // UIDOffset LE [0] = 62
+    plainData[7]  = (sdmUidOffset >> 8)  & 0xFF;
+    plainData[8]  = 0x00;
+    plainData[9]  =  sdmCtrOffset       & 0xFF;  // CTROff LE [0] = 77
+    plainData[10] = (sdmCtrOffset >> 8)  & 0xFF;
+    plainData[11] = 0x00;
+    plainData[12] =  sdmMacOffset       & 0xFF;  // SDMMACInputOffset LE = MACOff = 84
+    plainData[13] = (sdmMacOffset >> 8)  & 0xFF;
+    plainData[14] = 0x00;
+    plainData[15] =  sdmMacOffset       & 0xFF;  // SDMMACOffset LE [0] = 84
+    plainData[16] = (sdmMacOffset >> 8)  & 0xFF;
+    plainData[17] = 0x00;
+    plainData[18] = 0x80;                          // ISO7816 padding byte
+    // [19..31] already 0x00 from memset
+
+    logDebug("FileSettings: " + NTAG424Crypto::bytesToHexString(plainData, 32));
+
+    // IV = E(SesAuthENCKey, A55A || TI || CmdCtr(2LE) || 0*8)
+    uint8_t ivInput[16];
+    ivInput[0] = 0xA5; ivInput[1] = 0x5A;
+    memcpy(ivInput + 2, transactionId, 4);
+    ivInput[6] = commandCounter & 0xFF;
+    ivInput[7] = (commandCounter >> 8) & 0xFF;
+    memset(ivInput + 8, 0x00, 8);
+
+    uint8_t zeroIV[16] = {0};
+    uint8_t iv[16];
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, zeroIV, ivInput, 16, iv)) {
+        logError("setupSDM: IV calculation failed");
+        return false;
+    }
+
+    uint8_t encData[32];
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, iv, plainData, 32, encData)) {
+        logError("setupSDM: encryption failed");
+        return false;
+    }
+    logDebug("EncData: " + NTAG424Crypto::bytesToHexString(encData, 32));
+
+    // MAC input: INS(1) || CmdCtr(2LE) || TI(4) || FileNo(1) || EncData(32) = 40 bytes
+    uint8_t macInput[40];
+    macInput[0] = 0x5F;
+    macInput[1] = commandCounter & 0xFF;
+    macInput[2] = (commandCounter >> 8) & 0xFF;
+    memcpy(macInput + 3, transactionId, 4);
+    macInput[7] = 0x02;
+    memcpy(macInput + 8, encData, 32);
+
+    uint8_t mac[8];
+    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 40, mac)) {
+        logError("setupSDM: CMAC failed");
+        return false;
+    }
+    logDebug("MAC: " + NTAG424Crypto::bytesToHexString(mac, 8));
+
+    // Native command: [0x5F][FileNo=0x02][EncData(32)][MAC(8)] = 42 bytes
+    uint8_t cmd[42];
+    cmd[0] = 0x5F;
+    cmd[1] = 0x02;
+    memcpy(cmd + 2,  encData, 32);
+    memcpy(cmd + 34, mac, 8);
+
+    logDebug("CFS plainData: " + NTAG424Crypto::bytesToHexString(plainData, 32));
+    logDebug("CFS full cmd:  " + NTAG424Crypto::bytesToHexString(cmd, 42));
+    logDebug("CFS CmdCtr=" + String(commandCounter));
+
+    uint8_t response[16];
+    size_t responseLen = sizeof(response);
+    if (!sendCommand(cmd, 42, response, responseLen)) {
+        logError("setupSDM: ChangeFileSettings failed");
+        return false;
+    }
+
+    commandCounter++;
+    logDebug("SDM configured. CmdCtr=" + String(commandCounter));
+    logToWeb("✅ SDM geconfigureerd op NDEF bestand", "success");
+    return true;
+}
+
+// ── SDM: read UID + counter + CMAC without authentication ──────────────────────
+NTAG424Handler::SDMData NTAG424Handler::readSDMData() {
+    SDMData data;
+    data.valid = false;
+
+    // ReadData: [INS=0xAD][FileNo=0x02][Offset(3LE)][Length(3LE)]
+    // Layout in file (file-relative offsets):
+    //   [62..75]  = UID  (14 ASCII hex chars, UIDOffset=62)
+    //   [76]      = gap  (1 char)
+    //   [77..82]  = CTR  (6  ASCII hex chars, CTROff=77)
+    //   [83]      = gap  (1 char)
+    //   [84..99]  = MAC  (16 ASCII hex chars, MACOff=84)
+    //   [100..103]= trailing (not mirrored)
+    // Read 38 bytes: 14+1+6+1+16 = 38 bytes starting from UIDOffset.
+    if (sdmUidOffset == 0) {
+        logDebug("readSDMData: sdmUidOffset not set");
+        return data;
+    }
+    uint8_t cmd[8];
+    cmd[0] = 0xAD; // ReadData
+    cmd[1] = 0x02; // NDEF file
+    cmd[2] =  sdmUidOffset & 0xFF;
+    cmd[3] = (sdmUidOffset >> 8) & 0xFF;
+    cmd[4] = 0x00;
+    cmd[5] = 38;   // 14(UID) + 1(gap) + 6(CTR) + 1(gap) + 16(MAC)
+    cmd[6] = 0x00;
+    cmd[7] = 0x00;
+
+    logDebug("readSDMData offset=0x" + String(sdmUidOffset, HEX) + " len=38");
+
+    uint8_t response[48];
+    size_t responseLen = sizeof(response);
+    if (!sendCommand(cmd, 8, response, responseLen) || responseLen < 38) {
+        logDebug("readSDMData: failed (" + String(responseLen) + " bytes)");
+        return data;
+    }
+
+    // Decode: [0..13]=UID, [14]=gap, [15..20]=CTR, [21]=gap, [22..37]=MAC.
+    auto hexByte = [](const uint8_t* p) -> uint8_t {
+        auto nibble = [](uint8_t c) -> uint8_t {
+            return (c >= '0' && c <= '9') ? (c - '0') :
+                   (c >= 'A' && c <= 'F') ? (c - 'A' + 10) :
+                   (c >= 'a' && c <= 'f') ? (c - 'a' + 10) : 0;
+        };
+        return (nibble(p[0]) << 4) | nibble(p[1]);
+    };
+    for (int i = 0; i < 7; i++)  data.uid[i] = hexByte(response +  0 + i * 2);
+    for (int i = 0; i < 3; i++)  data.ctr[i] = hexByte(response + 15 + i * 2); // CTR at [15], skip gap [14]
+    for (int i = 0; i < 8; i++)  data.mac[i] = hexByte(response + 22 + i * 2); // MAC at [22], skip gap [21]
+    data.valid = true;
+
+    logDebug("SDM UID: " + NTAG424Crypto::bytesToHexString(data.uid, 7));
+    logDebug("SDM CTR: " + NTAG424Crypto::bytesToHexString(data.ctr, 3));
+    logDebug("SDM MAC: " + NTAG424Crypto::bytesToHexString(data.mac, 8));
+    return data;
 }
 
 bool NTAG424Handler::selectApplication(const uint8_t* aid) {
@@ -1261,12 +1538,11 @@ bool NTAG424Handler::transceive(const uint8_t* cmd, size_t cmdLen,
     
     // For ISO-DEP, we need to wrap the command with a PCB (Protocol Control Byte)
     // PCB format for I-block: 0x0A (no chaining, block number 0) or 0x0B (block 1)
-    // We'll use a simple static block toggle for now
-    static uint8_t blockNumber = 0;
+    // isoBlockNumber is a member variable, reset to 0 by resetSession() on each new card.
     
     // Build ISO-DEP I-block
     uint8_t isoCmd[256];
-    isoCmd[0] = 0x02 | (blockNumber & 0x01); // I-block with block number toggle
+    isoCmd[0] = 0x02 | (isoBlockNumber & 0x01); // I-block with block number toggle
     memcpy(isoCmd + 1, cmd, cmdLen);
     size_t isoCmdLen = cmdLen + 1;
     
@@ -1284,7 +1560,7 @@ bool NTAG424Handler::transceive(const uint8_t* cmd, size_t cmdLen,
 
         // Clear any pending IRQ status
         nfc->clearIRQStatus(0xFFFFFFFF);
-        delay(5);
+        delay(1);
 
         // Send command to card
         if (!nfc->sendData(isoCmd, isoCmdLen)) {
@@ -1311,7 +1587,7 @@ bool NTAG424Handler::transceive(const uint8_t* cmd, size_t cmdLen,
                 return false;
             }
 
-            delay(2);
+            delayMicroseconds(50);
         }
 
         if (!(irqStatus & RX_IRQ_STAT)) {
@@ -1365,7 +1641,7 @@ bool NTAG424Handler::transceive(const uint8_t* cmd, size_t cmdLen,
     if ((pcb & 0xE2) == 0x02) {
         // I-block response - normal data
         // Toggle block number for next transmission
-        blockNumber = (blockNumber + 1) & 0x01;
+        isoBlockNumber = (isoBlockNumber + 1) & 0x01;
         
         // Extract payload (skip PCB, exclude CRC which PN5180 handles)
         // PN5180 in ISO14443 mode with CRC enabled will strip the CRC automatically
@@ -1414,6 +1690,7 @@ bool NTAG424Handler::changeKeySettings(uint8_t settings) {
     
     // Step 1: Prepare plaintext data (16 bytes)
     // Format: [KeySettings:1] [CRC32:4] [Padding:11]
+
     uint8_t plainData[16];
     plainData[0] = settings;
     

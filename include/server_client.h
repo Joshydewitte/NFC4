@@ -325,8 +325,7 @@ public:
     };
     
     ScanResult scanWithProof(const String& cardUID, const String& encRndB, 
-                             const String& encResponse, const String& transactionId) {
-        ScanResult result;
+                             const String& encResponse, const String& transactionId) {        ScanResult result;
         result.success = false;
         result.credits = 0;
         
@@ -417,7 +416,63 @@ public:
         http.end();
         return result;
     }
-    
+
+    // ─── SDM FAST SCAN ───────────────────────────────────────────────────────────
+    // POST /api/scan/sdm — single APDU authentication using the card's SDM mirrors.
+    // UID, counter and CMAC are read back from the NDEF file; the server verifies
+    // the CMAC with K0. No nonce/challenge is consumed.
+    ScanResult sendSDMScan(const String& cardUID, const String& sdmUidHex,
+                           const String& sdmCtrHex, const String& sdmMacHex) {
+        ScanResult result;
+        result.success = false;
+        result.credits = 0;
+
+        if (serverUrl.isEmpty()) {
+            result.status = "error";
+            return result;
+        }
+
+        StaticJsonDocument<384> requestDoc;
+        requestDoc["uid"]     = cardUID;
+        requestDoc["sdmUid"]  = sdmUidHex;
+        requestDoc["sdmCtr"]  = sdmCtrHex;
+        requestDoc["sdmMac"]  = sdmMacHex;
+        requestDoc["readerId"] = getReaderId();
+
+        String requestBody;
+        serializeJson(requestDoc, requestBody);
+
+        http.begin(serverUrl + "/api/scan/sdm");
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(3000);
+        addReaderAuthHeaders();
+
+        int httpCode = http.POST(requestBody);
+
+        if (httpCode == 200) {
+            String responseStr = http.getString();
+            StaticJsonDocument<512> doc;
+            if (!deserializeJson(doc, responseStr)) {
+                result.success = doc["success"] | false;
+                result.status  = doc["status"]  | "";
+                result.credits = doc["credits"] | 0;
+                result.message = doc["message"] | "";
+            }
+        } else {
+            // Non-200: SDM not set up or CMAC invalid — caller falls back to full auth
+            String responseStr = http.getString();
+            StaticJsonDocument<256> doc;
+            if (!deserializeJson(doc, responseStr)) {
+                result.status = doc["status"] | "sdm_failed";
+            } else {
+                result.status = "sdm_failed";
+            }
+        }
+
+        http.end();
+        return result;
+    }
+
     bool verifyResponse(const String& cardUID, const String& response, const String& rndB = "", const String& transactionId = "") {
         if (serverUrl.isEmpty()) {
             logToWeb("❌ Geen server geconfigureerd voor verificatie", "error");

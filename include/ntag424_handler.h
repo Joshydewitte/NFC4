@@ -144,6 +144,49 @@ public:
      */
     bool writeNDEF(const String& url);
 
+    // ── SDM (Secure Dynamic Messaging) ─────────────────────────────────────────
+    // After setupSDM() is called once (requires auth), every subsequent tap can be
+    // authenticated with a single ReadData APDU — no 3-way handshake needed.
+    // The card mirrors UID + monotone read-counter + CMAC at fixed file offsets.
+    // Server verifies the CMAC using the card's K0; replay protection via counter.
+
+    // NDEF file byte offsets where SDM ASCII-hex mirrors are placed.
+    // Computed dynamically by writeNDEF() and stored here for use by setupSDM()
+    // and readSDMData().  writeNDEF() appends "?sv=<36 ASCII hex placeholders>"
+    // to the URL; the offsets point to the start of each field in that suffix.
+    //
+    // ASCII mirror mode (SDMOptions bit1=1) writes uppercase hex ASCII:
+    //   UID(7 bytes) → 14 ASCII chars at sdmUidOffset
+    //   CTR(3 bytes) →  6 ASCII chars at sdmCtrOffset  (= sdmUidOffset + 14)
+    //   MAC(8 bytes) → 16 ASCII chars at sdmMacOffset  (= sdmCtrOffset +  6)
+    uint16_t sdmUidOffset = 0;   // set by writeNDEF(), used by setupSDM()
+    uint16_t sdmCtrOffset = 0;
+    uint16_t sdmMacOffset = 0;
+
+    // SDM data as read from the card (no authentication required).
+    struct SDMData {
+        uint8_t uid[7];  // UID mirrored by SDM
+        uint8_t ctr[3];  // SDMReadCtr, 3 bytes little-endian
+        uint8_t mac[8];  // SDMMAC, 8-byte truncated CMAC
+        bool valid;
+    };
+
+    /**
+     * Configure SDM on NDEF file (File 02). Requires prior authenticateEV2First().
+     * Sets CommMode=Plain+SDMEnable and configures UID/CTR/CMAC mirrors at the
+     * SDM_*_OFFSET positions. Call commitTransaction() afterwards to make permanent.
+     * @return true on success
+     */
+    bool setupSDM();
+
+    /**
+     * Read SDM data (UID + counter + CMAC) in a single ReadData APDU.
+     * Does NOT require authentication — any SDM-configured card responds.
+     * activateCard() must have been called first.
+     * @return SDMData with valid=true on success
+     */
+    SDMData readSDMData();
+
     /**
      * Select application (AID)
      * @param aid - Application ID (3 bytes)
@@ -177,6 +220,7 @@ private:
     uint8_t authenticatedKeyNo;    // Key number used for authentication
     uint8_t transactionId[4];      // TI - Transaction Identifier
     uint16_t commandCounter;       // CmdCtr - Command Counter (starts at 0 after auth)
+    uint8_t isoBlockNumber;        // ISO-DEP I-block toggle bit (reset per card)
     uint8_t sessionEncKey[16];     // Session encryption key
     uint8_t sessionMacKey[16];     // Session MAC key
     uint8_t currentIV[16];         // Current IV for chained CBC mode (EV2)

@@ -212,7 +212,7 @@ bool NFCReader::readCard(CardInfo& cardInfo) {
         if (i < 6) cardInfo.uidString += ":";
     }
     
-    // Determine card type
+    // Determine card type (always needed by caller)
     cardInfo.cardType = getCardTypeDescription(cardInfo.uid);
     cardInfo.isSecure = (cardInfo.cardType.indexOf("SECURE") >= 0 || 
                          cardInfo.cardType.indexOf("DESFire") >= 0 ||
@@ -224,6 +224,10 @@ bool NFCReader::readCard(CardInfo& cardInfo) {
         Serial.println(cardInfo.uidString);
         Serial.print(F("Type: "));
         Serial.println(cardInfo.cardType);
+        Serial.print(F("  UID[0]=0x"));
+        Serial.print(cardInfo.uid[0], HEX);
+        Serial.print(F(", 7-byte UID: "));
+        Serial.println((cardInfo.uid[6] != 0x00 || cardInfo.uid[5] != 0x00) ? "YES" : "NO");
         
         logToWeb("🔖 Kaart: " + cardInfo.uidString, "info");
         logToWeb("Type: " + cardInfo.cardType, "info");
@@ -236,11 +240,6 @@ bool NFCReader::readCard(CardInfo& cardInfo) {
 
 String NFCReader::getCardTypeDescription(const uint8_t* uid) const {
     bool is7ByteUID = detectCard7ByteUID(uid);
-    
-    Serial.print(F("  [DEBUG] UID[0]=0x"));
-    Serial.print(uid[0], HEX);
-    Serial.print(F(", 7-byte UID: "));
-    Serial.println(is7ByteUID ? "YES" : "NO");
     
     // Detection based on UID patterns
     if (uid[0] == 0x04 && is7ByteUID) {

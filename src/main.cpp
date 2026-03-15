@@ -323,9 +323,12 @@ void loop() {
         }
       }
     } // end debounce
+  } else {
+    // Card absent — clear debounce so the next tap is always processed fresh
+    lastScannedUID = "";
   }
   
-  delay(100); // Small delay to prevent tight loop
+  delay(20); // Keep loop responsive — lower = faster card detection
 }
 
 // ============ BUTTON HANDLING ============
@@ -564,16 +567,7 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
   }
   
   Serial.println(F("✅ Card activated for ISO-DEP"));
-  
-  // Read card version info
-  uint8_t versionInfo[28];
-  if (!ntag424Handler->getVersion(versionInfo)) {
-    Serial.println(F("❌ Failed to read card version"));
-    webServer.broadcastLog("❌ Kan versie info niet lezen", "error");
-    return;
-  }
-  
-  Serial.println(F("✅ Card version read successfully"));
+  // NOTE: getVersion() skipped — 3 extra round-trips not needed for auth flow.
   Serial.print(F("📇 Card UID: "));
   Serial.println(cardInfo.uidString);
   Serial.print(F("🏷️  Card Type: "));
@@ -590,7 +584,40 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
   String cardStatus = "unknown";
   bool cryptoProofSent = false;
   uint8_t derivedKey[16] = {0};
-  
+
+  // ── SDM fast path ────────────────────────────────────────────────────────────
+  // For cards previously configured with SDM, a single ReadData APDU replaces
+  // the full EV2 3-way handshake. The card mirrors UID + monotone counter + CMAC
+  // at fixed offsets in the NDEF file; the server verifies the CMAC.
+  // If SDM is not yet set up (first tap or non-SDM card) the server returns
+  // sdm_mac_invalid and we fall through to the normal full-auth flow below.
+  bool sdmSkipFullAuth = false;
+  if (serverClient.isServerOnline()) {
+    NTAG424Handler::SDMData sdmData = ntag424Handler->readSDMData();
+    if (sdmData.valid) {
+      String sdmUidHex="", sdmCtrHex="", sdmMacHex="";
+      for (int i=0;i<7;i++){char h[3];sprintf(h,"%02X",sdmData.uid[i]);sdmUidHex+=h;}
+      for (int i=0;i<3;i++){char h[3];sprintf(h,"%02X",sdmData.ctr[i]);sdmCtrHex+=h;}
+      for (int i=0;i<8;i++){char h[3];sprintf(h,"%02X",sdmData.mac[i]);sdmMacHex+=h;}
+      Serial.print(F("   SDM: ")); Serial.print(sdmUidHex.substring(0,8)); Serial.println(F("..."));
+      ServerClient::ScanResult sdmResult = serverClient.sendSDMScan(
+        cardInfo.uidString, sdmUidHex, sdmCtrHex, sdmMacHex
+      );
+      if (sdmResult.success) {
+        cardStatus = "personalized";
+        cryptoProofSent = true;
+        sdmSkipFullAuth = true;
+        Serial.println(F("   ⚡ SDM fast path OK"));
+        webServer.broadcastLog("⚡ SDM authenticatie geslaagd (snel pad)", "success");
+        if (sdmResult.credits > 0)
+          webServer.broadcastLog("💰 Credits: " + String(sdmResult.credits), "success");
+      } else {
+        Serial.print(F("   SDM fallback: ")); Serial.println(sdmResult.status);
+      }
+    }
+  }
+
+  if (!sdmSkipFullAuth) {
   if (hasCachedChallenge && serverClient.isServerOnline()) {
     // Step 1: POST /api/scan/start {uid, readerId}
     // Server looks up nonce by readerId and returns derived key K0
@@ -645,6 +672,7 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
             webServer.broadcastLog("✅ " + scanResult.message, "success");
             if (scanResult.credits > 0) webServer.broadcastLog("💰 Credits: " + String(scanResult.credits), "success");
             cryptoProofSent = true;
+            // SDM is configured during card personalization (writeNDEF → setupSDM).
           } else if (scanResult.status == "challenge_expired") {
             // Nonce was expired on server but card auth succeeded — server issued a fresh nonce.
             // Card is still on the reader: re-authenticate with the fresh nonce and retry.
@@ -782,6 +810,7 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
       webServer.broadcastLog("✅ Factory kaart (offline)", "success");
     }
   }
+  } // end if (!sdmSkipFullAuth)
 
   if (cardStatus == "unknown") {
     Serial.println(F("   ⚠️  Status: UNKNOWN"));
@@ -1048,22 +1077,20 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
     Serial.println(F("    ✅ NDEF URL geschreven!"));
     webServer.broadcastWriteCardStatus(uid, "success", "NDEF URL bijgewerkt: " + resolvedUrl);
 
+    // Set up SDM immediately after writing NDEF; offsets are now valid in handler.
+    if (ntag424Handler->setupSDM()) {
+      Serial.println(F("    ⚡ SDM geconfigureerd"));
+    } else {
+      Serial.println(F("    ⚠️ SDM configuratie mislukt (niet fataal)"));
+    }
+
     if (systemConfig.isSingleWriteMode()) {
       systemConfig.stopWriteMode();
       webServer.broadcastLog("Single mode: write mode gestopt", "info");
     }
     ntag424Handler->resetSession();
     return;
-  }
-
-  Serial.println(F("\n[2] NTAG424 HANDLER INITIALIZATION"));
-  if (ntag424Handler == nullptr) {
-    String errorMsg = "NTAG424 handler niet geïnitialiseerd";
-    Serial.println(F("    ❌ Handler not initialized"));
-    webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
-    return;
-  }
-  Serial.println(F("    ✅ Handler ready"));
+  }  // end if (ndefWriteMode == "ndef_only")
   
   // ═══════════════════════════════════════════════════════════════
   // AN12196 Section 6.1: ISO14443-4 PICC Activation
@@ -1387,8 +1414,16 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
       }
       Serial.println(F("    ✅ NDEF URL geschreven!"));
       webServer.broadcastWriteCardStatus(uid, "processing", "✅ NDEF URL: " + resolvedUrl);
-    }
-  }
+
+      // Set up SDM immediately after writing NDEF; offsets are now valid in handler.
+      if (ntag424Handler->setupSDM()) {
+        Serial.println(F("    ⚡ SDM geconfigureerd"));
+        webServer.broadcastWriteCardStatus(uid, "processing", "⚡ SDM ingeschakeld");
+      } else {
+        Serial.println(F("    ⚠️ SDM configuratie mislukt (niet fataal)"));
+      }
+    }  // end if (urlTemplate.length() > 0)
+  }  // end if (ndefWriteMode == "keys_and_ndef")
 
   Serial.println(F("\n╔═══════════════════════════════════════════╗"));
   Serial.println(F("║     ✅ CARD WRITE COMPLETE! ✅            ║"));
