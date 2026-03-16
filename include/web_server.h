@@ -619,6 +619,11 @@ private:
         Serial.print(F("✓ isDirectKey: "));
         Serial.println(isDirectKey ? "true (previous key is AES key)" : "false (previous key is master secret)");
         
+        // Parse resetToFactory (boolean)
+        bool resetToFactory = body.indexOf("\"resetToFactory\":true") > 0;
+        Serial.print(F("✓ resetToFactory: "));
+        Serial.println(resetToFactory ? "true (reset K0 naar 0x00*16)" : "false");
+        
         // Parse previousKey if not factory
         String previousKey = "";
         if (!isFactory) {
@@ -694,7 +699,7 @@ private:
         Serial.println(F("✓ mode valid"));
         
         // Validate previous key for non-factory cards (MUST be exactly 32 hex characters)
-        if (!isFactory) {
+        if (!isFactory && !resetToFactory) {
             Serial.println(F("Validating previousKey for non-factory card..."));
             
             if (previousKey.length() == 0) {
@@ -738,7 +743,8 @@ private:
         }
         config->setIsFactory(isFactory);
         config->setIsDirectKey(isDirectKey);
-        if (!isFactory) {
+        config->setResetToFactory(resetToFactory);
+        if (!isFactory && !resetToFactory) {
             config->setPreviousKey(previousKey);
         }
         config->setWriteMode(mode);
@@ -778,7 +784,7 @@ private:
         String json = "{\"success\":true,\"message\":\"Schrijfproces gestart in " + mode + " modus met " + keySource + " key source\"}";
         httpServer.send(200, "application/json", json);
         
-        String cardType = isFactory ? "factory" : "gepersonaliseerd";
+        String cardType = isFactory ? "factory" : (resetToFactory ? "factory reset" : "gepersonaliseerd");
         broadcastLog("🚀 Schrijfproces gestart (modus: " + mode + ", source: " + keySource + ", type: " + cardType + ")", "success");
     }
     

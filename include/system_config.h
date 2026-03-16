@@ -24,6 +24,7 @@ private:
     unsigned long writeActiveTimestamp;  // When write mode was activated
     bool writeIsFactory;
     bool writeIsDirectKey;  // true = Previous Key is direct key, false = Previous Key is master secret
+    bool writeResetToFactory;  // true = reset card back to factory key (0x00*16)
     String keySource;  // "esp32" or "server"
     
     // Constants
@@ -80,6 +81,8 @@ public:
     bool getIsFactory();
     void setIsDirectKey(bool direct);
     bool getIsDirectKey();
+    void setResetToFactory(bool reset);
+    bool getResetToFactory();
     void setKeySource(const String& source);
     String getKeySource();
     void setWriteMode(const String& mode);

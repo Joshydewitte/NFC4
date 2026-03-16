@@ -11,6 +11,7 @@ SystemConfig::SystemConfig()
       writeActive(false),
       writeIsFactory(true),
       writeIsDirectKey(false),  // Default: previous key is master secret
+      writeResetToFactory(false),
       keySource("esp32") {  // Default to ESP32 mode
     startTime = millis();
 }
@@ -263,6 +264,7 @@ void SystemConfig::stopWriteMode() {
         writeMode = "";
         writeIsFactory = false;
         writeIsDirectKey = false;
+        writeResetToFactory = false;
         keySource = "esp32";
         Serial.println(F("✅ Write mode volledig opgeschoond"));
     }
@@ -295,6 +297,16 @@ void SystemConfig::setIsDirectKey(bool direct) {
 
 bool SystemConfig::getIsDirectKey() {
     return writeIsDirectKey;
+}
+
+void SystemConfig::setResetToFactory(bool reset) {
+    writeResetToFactory = reset;
+    Serial.print(F("Reset naar factory: "));
+    Serial.println(reset ? "ja" : "nee");
+}
+
+bool SystemConfig::getResetToFactory() {
+    return writeResetToFactory;
 }
 
 void SystemConfig::setKeySource(const String& source) {

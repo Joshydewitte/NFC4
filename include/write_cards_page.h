@@ -350,6 +350,30 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
         <h1>📝 Kaarten Schrijven</h1>
         <p class="subtitle">⚠️ LET OP: Schrijven kan NIET ongedaan worden gemaakt!</p>
 
+        <!-- Operatie Mode Selection -->
+        <div class="secret-section">
+            <label class="secret-label">⚙️ Operatie</label>
+            <div class="mode-selector">
+                <div class="mode-option active" data-op="personalize">
+                    <div class="mode-icon">✍️</div>
+                    <div class="mode-title">Personaliseren</div>
+                    <div class="mode-desc">Schrijf unieke key naar kaart</div>
+                </div>
+                <div class="mode-option" data-op="reset">
+                    <div class="mode-icon">🔄</div>
+                    <div class="mode-title">Reset naar Factory</div>
+                    <div class="mode-desc">Zet K0 terug naar 0x00...00</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Factory Reset Warning (hidden until reset mode is selected) -->
+        <div id="factoryResetWarning" style="display: none; background: #744210; border: 1px solid #d69e2e; border-radius: 8px; padding: 12px; margin-bottom: 16px; color: #fefcbf; font-size: 14px;">
+            ⚠️ <strong>Factory Reset Modus</strong><br>
+            De kaart wordt teruggezet naar de standaard fabriekssleutel (0x00...00).<br>
+            Gebruik het <strong>zelfde master secret</strong> waarmee de kaart oorspronkelijk is gedopt.
+        </div>
+
         <!-- Key Source Selection -->
         <div class="secret-section">
             <label class="secret-label">🔑 Key Bron</label>
@@ -380,7 +404,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
         </div>
 
         <!-- Card Type Selection -->
-        <div class="secret-section">
+        <div class="secret-section" id="cardTypeSection">
             <label class="secret-label">🏭 Kaart Type</label>
             <div style="margin-bottom: 10px;">
                 <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
@@ -427,7 +451,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
         </div>
 
         <!-- NDEF Write Mode Selection -->
-        <div class="secret-section">
+        <div class="secret-section" id="ndefModeSection">
             <label class="secret-label">🌐 URL Schrijven</label>
             <div class="mode-selector">
                 <div class="mode-option" data-ndef="keys_and_ndef">
@@ -488,6 +512,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
         let currentMode = 'single';
         let ndefWriteMode = 'keys_only';
         let keySource = 'esp32';  // NEW: esp32 or server
+        let isResetMode = false;  // true = factory reset operatie
         let stats = { success: 0, failed: 0, total: 0 };
 
         // Initialize WebSocket connection
@@ -588,6 +613,11 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             
             // Show status section
             document.getElementById('statusSection').classList.add('visible');
+            
+            // In single mode, switch back to Start button after final status
+            if ((data.status === 'success' || data.status === 'error') && currentMode === 'single') {
+                stopWriting();
+            }
         }
 
         // Update statistics
@@ -607,6 +637,41 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             logSection.appendChild(entry);
             logSection.scrollTop = logSection.scrollHeight;
         }
+
+        // Update UI when operatie mode changes
+        function updateResetModeUI() {
+            const cardTypeSection = document.getElementById('cardTypeSection');
+            const ndefModeSection = document.getElementById('ndefModeSection');
+            const factoryResetWarning = document.getElementById('factoryResetWarning');
+            const startBtn = document.getElementById('startBtn');
+            
+            if (isResetMode) {
+                cardTypeSection.style.display = 'none';
+                ndefModeSection.style.display = 'none';
+                factoryResetWarning.style.display = 'block';
+                startBtn.textContent = '🔄 Start Factory Reset';
+            } else {
+                cardTypeSection.style.display = '';
+                ndefModeSection.style.display = '';
+                factoryResetWarning.style.display = 'none';
+                startBtn.textContent = '▶️ Start Schrijven';
+            }
+        }
+
+        // Operatie Mode selection (Personaliseren vs Reset naar Factory)
+        document.querySelectorAll('[data-op]').forEach(option => {
+            option.addEventListener('click', function() {
+                if (isRunning) return;
+                
+                document.querySelectorAll('[data-op]').forEach(opt => {
+                    opt.classList.remove('active');
+                });
+                this.classList.add('active');
+                isResetMode = this.dataset.op === 'reset';
+                updateResetModeUI();
+                addLog(`Operatie: ${isResetMode ? 'Reset naar Factory' : 'Personaliseren'}`, 'info');
+            });
+        });
 
         // Key Source selection (ESP32 vs Server)
         document.querySelectorAll('[data-source]').forEach(option => {
@@ -755,8 +820,8 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                 }
             }
 
-            // Validation for personalized cards (both modes)
-            if (!isFactory) {
+            // Validation for personalized cards (both modes) — skip in reset mode
+            if (!isFactory && !isResetMode) {
                 if (!previousKey) {
                     alert('⚠️ Voer de vorige key in!');
                     return;
@@ -778,17 +843,28 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             const modeName = currentMode === 'single' ? 'enkele kaart' : 'continue mode';
             const cardType = isFactory ? 'Factory kaarten (0x00...00)' : 'Gepersonaliseerde kaarten';
             
-            let confirmMessage = `🚨 BEVESTIG SCHRIJVEN 🚨\\n\\n`;
-            confirmMessage += `Key bron: ${sourceName}\\n`;
-            confirmMessage += `Schrijf modus: ${modeName}\\n`;
-            confirmMessage += `Kaart type: ${cardType}\\n\\n`;
-            
-            if (keySource === 'esp32') {
-                confirmMessage += `Secret (eerste 8): ${masterSecret.substring(0, 8)}...\\n\\n`;
+            let confirmMessage;
+            if (isResetMode) {
+                confirmMessage = `🔄 BEVESTIG FACTORY RESET 🔄\n\n`;
+                confirmMessage += `Key bron: ${sourceName}\n`;
+                confirmMessage += `Schrijf modus: ${modeName}\n\n`;
+                if (keySource === 'esp32') {
+                    confirmMessage += `Secret (eerste 8): ${masterSecret.substring(0, 8)}...\n\n`;
+                }
+                confirmMessage += `De K0-sleutel van de kaart wordt teruggezet naar 0x00...00.\n`;
+                confirmMessage += `⚠️ DIT KAN NIET ONGEDAAN WORDEN!\n\n`;
+                confirmMessage += `Weet je ZEKER dat je wilt resetten?`;
+            } else {
+                confirmMessage = `🚨 BEVESTIG SCHRIJVEN 🚨\n\n`;
+                confirmMessage += `Key bron: ${sourceName}\n`;
+                confirmMessage += `Schrijf modus: ${modeName}\n`;
+                confirmMessage += `Kaart type: ${cardType}\n\n`;
+                if (keySource === 'esp32') {
+                    confirmMessage += `Secret (eerste 8): ${masterSecret.substring(0, 8)}...\n\n`;
+                }
+                confirmMessage += `⚠️ DIT KAN NIET ONGEDAAN WORDEN!\n\n`;
+                confirmMessage += `Weet je ZEKER dat je wilt starten?`;
             }
-            
-            confirmMessage += `⚠️ DIT KAN NIET ONGEDAAN WORDEN!\\n\\n`;
-            confirmMessage += `Weet je ZEKER dat je wilt starten?`;
             
             if (!confirm(confirmMessage)) {
                 addLog('❌ Schrijven geannuleerd door gebruiker', 'warning');
@@ -797,11 +873,12 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
             
             // SECOND CONFIRMATION FOR ESP32 MODE WITH MASTER SECRET
             if (keySource === 'esp32') {
-                let secondConfirm = `🔐 VERIFIEER MASTER SECRET 🔐\\n\\n`;
-                secondConfirm += `Je gaat het volgende master secret gebruiken:\\n`;
-                secondConfirm += `\\n"${masterSecret}"\\n\\n`;
-                secondConfirm += `⚠️ CONTROLEER DIT ZORGVULDIG!\\n`;
-                secondConfirm += `Dit secret wordt gebruikt om keys af te leiden.\\n\\n`;
+                const opLabel = isResetMode ? 'factory reset' : 'key afleiden';
+                let secondConfirm = `🔐 VERIFIEER MASTER SECRET 🔐\n\n`;
+                secondConfirm += `Je gaat het volgende master secret gebruiken voor ${opLabel}:\n`;
+                secondConfirm += `\n"${masterSecret}"\n\n`;
+                secondConfirm += `⚠️ CONTROLEER DIT ZORGVULDIG!\n`;
+                secondConfirm += `Dit secret wordt gebruikt om keys af te leiden.\n\n`;
                 secondConfirm += `Klopt dit master secret?`;
                 
                 if (!confirm(secondConfirm)) {
@@ -827,10 +904,11 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
                     keySource: keySource,
                     masterSecret: keySource === 'esp32' ? masterSecret : '',
                     mode: currentMode,
-                    isFactory: isFactory,
-                    isDirectKey: isDirectKey,
-                    previousKey: isFactory ? '' : previousKey,  // NEVER send null, always string
-                    ndefMode: ndefWriteMode
+                    isFactory: isResetMode ? false : isFactory,
+                    isDirectKey: isResetMode ? false : isDirectKey,
+                    previousKey: (isFactory || isResetMode) ? '' : previousKey,  // NEVER send null, always string
+                    ndefMode: isResetMode ? 'keys_only' : ndefWriteMode,
+                    resetToFactory: isResetMode
                 };
                 
                 console.log('Request body:', requestBody);
@@ -876,7 +954,9 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
 
         function stopWriting() {
             isRunning = false;
-            document.getElementById('startBtn').style.display = 'flex';
+            const startBtn = document.getElementById('startBtn');
+            startBtn.style.display = 'flex';
+            startBtn.textContent = isResetMode ? '🔄 Start Factory Reset' : '▶️ Start Schrijven';
             document.getElementById('stopBtn').style.display = 'none';
         }
 

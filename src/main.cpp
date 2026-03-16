@@ -1132,9 +1132,19 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("\n[5] DETERMINE OLD KEY"));
   bool isFactory = systemConfig.getIsFactory();
   bool isDirectKey = systemConfig.getIsDirectKey();
+  bool resetToFactory = systemConfig.getResetToFactory();
   uint8_t oldKey[16];
   
-  if (isFactory) {
+  if (resetToFactory) {
+    // Factory reset: authenticate with current personalized key, then change to 0x00*16
+    memcpy(oldKey, derivedKey, 16);   // derivedKey = current personalized K0
+    memset(derivedKey, 0, 16);        // new key = factory zeros
+    Serial.println(F("    Type: Factory reset - kaart terugzetten naar 0x00*16"));
+    Serial.print(F("    Old Key (current): "));
+    Serial.println(NTAG424Crypto::bytesToHexString(oldKey, 16));
+    Serial.println(F("    New Key (target):  00000000000000000000000000000000"));
+    webServer.broadcastWriteCardStatus(uid, "processing", "Factory reset: authenticeer met personalized key...");
+  } else if (isFactory) {
     // Factory kaart: gebruik default key (0x00...00)
     memcpy(oldKey, NTAG424Handler::DEFAULT_AES_KEY, 16);
     Serial.println(F("    Type: Factory card"));
@@ -1208,8 +1218,10 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
     String errorMsg = "Authenticatie mislukt: " + authResult.errorMessage;
     Serial.print(F("    ❌ Authentication failed: "));
     Serial.println(authResult.errorMessage);
-    if (!isFactory) {
+    if (!isFactory && !resetToFactory) {
       errorMsg += " (Controleer of vorige key correct is)";
+    } else if (resetToFactory) {
+      errorMsg += " (Controleer of master secret overeenkomt met de dop-sessie)";
     }
     webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
     ntag424Handler->resetSession();
@@ -1382,10 +1394,10 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println();
 
   // ═══════════════════════════════════════════════════════════════
-  // [9] WRITE NDEF URL (keys_and_ndef mode only)
+  // [9] WRITE NDEF URL (keys_and_ndef mode only, skip for factory reset)
   // Session from verifyResult2 auth is still active.
   // ═══════════════════════════════════════════════════════════════
-  if (ndefWriteMode == "keys_and_ndef") {
+  if (!resetToFactory && ndefWriteMode == "keys_and_ndef") {
     Serial.println(F("\n[9] WRITE NDEF URL (keys_and_ndef mode)"));
     Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
     webServer.broadcastWriteCardStatus(uid, "processing", "Schrijf NDEF URL...");
@@ -1428,7 +1440,11 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("\n╔═══════════════════════════════════════════╗"));
   Serial.println(F("║     ✅ CARD WRITE COMPLETE! ✅            ║"));
   Serial.println(F("╚═══════════════════════════════════════════╝"));
-  webServer.broadcastWriteCardStatus(uid, "success", "Kaart succesvol geschreven en volledig geverifieerd!");
+  if (resetToFactory) {
+    webServer.broadcastWriteCardStatus(uid, "success", "Kaart gereset naar factory state (K0 = 00...00)!");
+  } else {
+    webServer.broadcastWriteCardStatus(uid, "success", "Kaart succesvol geschreven en volledig geverifieerd!");
+  }
   
   // Check if we're in single mode - if so, stop after one card
   if (systemConfig.isSingleWriteMode()) {
