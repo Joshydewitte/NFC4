@@ -170,7 +170,10 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
 <body>
     <div class="header">
         <h1>⚙️ NFC Reader Instellingen</h1>
-        <button class="logout-btn" onclick="logout()">Uitloggen</button>
+        <div style="display:flex;gap:10px;align-items:center;">
+            <a href="/" style="background:#667eea;color:white;padding:8px 16px;border-radius:6px;text-decoration:none;font-size:14px;">← Dashboard</a>
+            <button class="logout-btn" onclick="logout()">Uitloggen</button>
+        </div>
     </div>
 
     <div id="message"></div>
@@ -203,14 +206,14 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
         </div>
         <div class="form-group">
             <label>Reader ID (Voer dit in op de server)</label>
-            <div style="font-family: monospace; font-size: 1.1em; background: #f0f4ff; border: 2px solid #667eea; padding: 12px; border-radius: 8px; letter-spacing: 2px; color: #333;" id="readerIdDisplay">Laden...</div>
-            <small style="color: #888; display: block; margin-top: 5px;">MAC: <span id="readerMacDisplay">...</span></small>
+            <div style="font-family: monospace; font-size: 1.1em; background: #f0f4ff; border: 2px solid #667eea; padding: 12px; border-radius: 8px; letter-spacing: 2px; color: #333;">%READER_ID%</div>
+            <small style="color: #888; display: block; margin-top: 5px;">MAC: %READER_MAC%</small>
         </div>
         <div class="form-group">
             <label for="readerApiToken">API Token (van de server na registratie)</label>
             <input type="text" id="readerApiToken" placeholder="Na registratie op server invullen" maxlength="64">
         </div>
-        <div id="readerTokenStatus" style="margin-bottom: 10px;"></div>
+        <div id="readerTokenStatus" style="margin-bottom: 10px;">%READER_TOKEN_STATUS%</div>
         <button onclick="saveReaderToken()">💾 Token Opslaan</button>
     </div>
 
@@ -518,22 +521,24 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
         }
 
         function loadReaderInfo() {
+            // Reader ID and MAC are already rendered server-side.
+            // Only fetch the live token/server-registration status.
             fetch('/api/reader/info', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
-                document.getElementById('readerIdDisplay').textContent = data.readerId || 'Niet beschikbaar';
-                document.getElementById('readerMacDisplay').textContent = data.mac || '';
                 const statusEl = document.getElementById('readerTokenStatus');
-                if (data.hasToken) {
+                if (!data.hasToken) {
+                    statusEl.innerHTML = '<span style="color:#f57c00;">⚠️ Geen token — registreer deze reader op de server</span>';
+                    document.getElementById('readerApiToken').placeholder = 'Na registratie op server invullen';
+                } else if (data.serverStatus === 'removed') {
+                    statusEl.innerHTML = '<span style="color:#e53935;">❌ Reader verwijderd van server — registreer opnieuw met de Reader ID hierboven en voer het nieuwe token in</span>';
+                    document.getElementById('readerApiToken').placeholder = 'Nieuw token na herregistratie';
+                } else {
                     statusEl.innerHTML = '<span style="color:#4caf50;">✅ Token geconfigureerd — reader is geregistreerd</span>';
                     document.getElementById('readerApiToken').placeholder = '(token al opgeslagen)';
-                } else {
-                    statusEl.innerHTML = '<span style="color:#f57c00;">⚠️ Geen token — registreer deze reader op de server</span>';
                 }
             })
-            .catch(() => {
-                document.getElementById('readerIdDisplay').textContent = 'Fout bij laden';
-            });
+            .catch(() => { /* Reader ID is already visible — token status kon niet worden geladen */ });
         }
 
         function saveReaderToken() {

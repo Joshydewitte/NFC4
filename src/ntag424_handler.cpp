@@ -1003,6 +1003,42 @@ bool NTAG424Handler::selectNdefApplication() {
     return transceiveRaw(cmd, 13, response, responseLen);
 }
 
+bool NTAG424Handler::writeEmptyNDEF() {
+    // Write NLEN=0x0000 to File 02 (NDEF file).
+    // NLEN=0 means "no NDEF message present" per NFC Forum Type 4 Tag spec.
+    // Phones and readers will treat the card as blank and take no action.
+    uint8_t emptyFile[2] = {0x00, 0x00};
+
+    uint8_t cmd[1 + 7 + 2];
+    cmd[0] = 0x8D;  // INS: WriteData
+    cmd[1] = 0x02;  // FileNo = 02 (NDEF file)
+    cmd[2] = 0x00;  // Offset LE byte 0
+    cmd[3] = 0x00;  // Offset byte 1
+    cmd[4] = 0x00;  // Offset byte 2
+    cmd[5] = 0x02;  // Length byte 0 (2 bytes)
+    cmd[6] = 0x00;  // Length byte 1
+    cmd[7] = 0x00;  // Length byte 2
+    cmd[8] = 0x00;  // NLEN high byte
+    cmd[9] = 0x00;  // NLEN low byte
+
+    logDebug(">> WriteData File02 (empty NDEF, NLEN=0)");
+    logToWeb("Wis NDEF inhoud...", "info");
+
+    uint8_t response[16];
+    size_t responseLen = sizeof(response);
+    if (!sendCommand(cmd, 10, response, responseLen)) {
+        logToWeb("NDEF wissen mislukt", "error");
+        return false;
+    }
+    commandCounter++;
+    // Clear SDM offsets — there is no NDEF content to mirror from
+    sdmUidOffset = 0;
+    sdmCtrOffset = 0;
+    sdmMacOffset = 0;
+    logDebug("Empty NDEF written. CmdCtr=" + String(commandCounter));
+    return true;
+}
+
 bool NTAG424Handler::writeNDEF(const String& url) {
     // Write a minimal NDEF URI record to NTAG424 NDEF file (File No 0x02, ISO EF E104).
     //
@@ -1311,6 +1347,91 @@ bool NTAG424Handler::setupSDM() {
     commandCounter++;
     logDebug("SDM configured. CmdCtr=" + String(commandCounter));
     logToWeb("✅ SDM geconfigureerd op NDEF bestand", "success");
+    return true;
+}
+
+bool NTAG424Handler::disableSDM() {
+    if (!authenticated) {
+        logError("disableSDM requires prior authentication");
+        return false;
+    }
+
+    logDebug("DisableSDM: CmdCtr=" + String(commandCounter)
+           + " TI=" + NTAG424Crypto::bytesToHexString(transactionId, 4));
+
+    // ChangeFileSettings plaintext: FileOption(1) + AR(2) + ISO7816-pad = 4 bytes → pad to 16
+    // FileOption=0x00: CommMode=Plain, SDM disabled
+    // AccessRights: RW=E(free), CAR=0(K0), W=E(free), R=E(free) — same as factory default
+    uint8_t plainData[16];
+    memset(plainData, 0, sizeof(plainData));
+    plainData[0] = 0x00;  // FileOption: SDM disabled, CommMode=Plain
+    plainData[1] = 0xE0;  // AR[0]: RW=E(free), CAR=0(K0)
+    plainData[2] = 0xEE;  // AR[1]: W=E(free), R=E(free)
+    plainData[3] = 0x80;  // ISO7816 padding
+    // [4..15] already 0x00
+
+    logDebug("DisableSDM plainData: " + NTAG424Crypto::bytesToHexString(plainData, 16));
+
+    // IV = E(SesAuthENCKey, A55A || TI || CmdCtr(2LE) || 0*8)
+    uint8_t ivInput[16];
+    ivInput[0] = 0xA5; ivInput[1] = 0x5A;
+    memcpy(ivInput + 2, transactionId, 4);
+    ivInput[6] = commandCounter & 0xFF;
+    ivInput[7] = (commandCounter >> 8) & 0xFF;
+    memset(ivInput + 8, 0x00, 8);
+
+    uint8_t zeroIV[16] = {0};
+    uint8_t iv[16];
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, zeroIV, ivInput, 16, iv)) {
+        logError("disableSDM: IV calculation failed");
+        return false;
+    }
+
+    uint8_t encData[16];
+    if (!NTAG424Crypto::aesEncrypt(sessionEncKey, iv, plainData, 16, encData)) {
+        logError("disableSDM: encryption failed");
+        return false;
+    }
+
+    // CmdMAC input: INS(1) || CmdCtr(2LE) || TI(4) || FileNo(1) || EncData(16) = 24 bytes
+    uint8_t macInput[24];
+    macInput[0] = 0x5F;
+    macInput[1] = commandCounter & 0xFF;
+    macInput[2] = (commandCounter >> 8) & 0xFF;
+    memcpy(macInput + 3, transactionId, 4);
+    macInput[7] = 0x02; // FileNo
+    memcpy(macInput + 8, encData, 16);
+
+    uint8_t mac[8];
+    if (!NTAG424Crypto::calculateCMAC(sessionMacKey, macInput, 24, mac)) {
+        logError("disableSDM: CMAC failed");
+        return false;
+    }
+
+    // Native command: [0x5F][FileNo=0x02][EncData(16)][MAC(8)] = 26 bytes
+    uint8_t cmd[26];
+    cmd[0] = 0x5F;
+    cmd[1] = 0x02;
+    memcpy(cmd + 2, encData, 16);
+    memcpy(cmd + 18, mac, 8);
+
+    logDebug("DisableSDM CFS cmd: " + NTAG424Crypto::bytesToHexString(cmd, 26));
+    logDebug("DisableSDM CmdCtr=" + String(commandCounter));
+
+    uint8_t response[16];
+    size_t responseLen = sizeof(response);
+    if (!sendCommand(cmd, 26, response, responseLen)) {
+        logError("disableSDM: ChangeFileSettings failed");
+        return false;
+    }
+
+    commandCounter++;
+    // Clear stored offsets so readSDMData() won't try to read them
+    sdmUidOffset = 0;
+    sdmCtrOffset = 0;
+    sdmMacOffset = 0;
+    logDebug("SDM disabled. CmdCtr=" + String(commandCounter));
+    logToWeb("SDM uitgeschakeld op NDEF bestand", "info");
     return true;
 }
 

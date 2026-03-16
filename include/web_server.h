@@ -187,14 +187,25 @@ private:
             httpServer.send(200, "application/json", json);
         });
 
-        // Reader info: ID + whether token is configured
+        // Reader info: ID + whether token is configured + whether server still knows us
         httpServer.on("/api/reader/info", HTTP_GET, [this]() {
             if (!requireAuth()) return;
-            String rid  = config->deriveReaderId();
-            String mac  = WiFi.macAddress();
+            String rid    = config->deriveReaderId();
+            String mac    = WiFi.macAddress();
             bool   hasTok = config->hasReaderToken();
-            String json = "{\"readerId\":\"" + rid + "\",\"mac\":\"" + mac + "\",\"hasToken\":" +
-                          (hasTok ? "true" : "false") + "}";
+
+            // Check if the server still accepts our token (quick /api/ping with auth headers)
+            String serverStatus = "unknown";
+            if (hasTok && serverClient && serverClient->isServerOnline()) {
+                int code = serverClient->checkReaderRegistration();
+                if (code == 200)      serverStatus = "ok";
+                else if (code == 401) serverStatus = "removed";
+                else                  serverStatus = "unknown";
+            }
+
+            String json = "{\"readerId\":\"" + rid + "\",\"mac\":\"" + mac +
+                          "\",\"hasToken\":" + (hasTok ? "true" : "false") +
+                          ",\"serverStatus\":\"" + serverStatus + "\"}";
             httpServer.send(200, "application/json", json);
         });
 
@@ -442,6 +453,21 @@ private:
         page.replace("%SERVER_URL%", config->getServerUrl());
         page.replace("%SERVER_STATUS%", serverClient->isServerOnline() ? "Online" : "Offline");
         page.replace("%SERVER_STATUS_CLASS%", serverClient->isServerOnline() ? "status-online" : "status-offline");
+
+        // Reader ID and MAC are always available locally — inject directly into HTML
+        // so they're visible even if JS/fetch fails or the server removed this reader.
+        page.replace("%READER_ID%", config->deriveReaderId());
+        page.replace("%READER_MAC%", WiFi.macAddress());
+
+        // Initial token status (refined by JS fetch after page load)
+        bool hasTok = config->hasReaderToken();
+        String tokenStatus;
+        if (hasTok) {
+            tokenStatus = "<span style=\"color:#4caf50;\">&#x2705; Token geconfigureerd &#x2014; controleer registratie...</span>";
+        } else {
+            tokenStatus = "<span style=\"color:#f57c00;\">&#x26A0;&#xFE0F; Geen token &#x2014; registreer deze reader op de server</span>";
+        }
+        page.replace("%READER_TOKEN_STATUS%", tokenStatus);
         
         String mode = config->getReaderMode();
         page.replace("%MACHINE_CHECKED%", mode == "machine" ? "checked" : "");

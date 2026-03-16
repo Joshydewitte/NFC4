@@ -1398,9 +1398,33 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println();
 
   // ═══════════════════════════════════════════════════════════════
-  // [9] WRITE NDEF URL (keys_and_ndef mode only, skip for factory reset)
+  // [9] RESET NDEF + SDM (factory reset) or WRITE NDEF (keys_and_ndef)
   // Session from verifyResult2 auth is still active.
   // ═══════════════════════════════════════════════════════════════
+  if (resetToFactory) {
+    Serial.println(F("\n[9] RESET NDEF + SDM (factory reset)"));
+    Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    webServer.broadcastWriteCardStatus(uid, "processing", "Reset NDEF en SDM naar factory...");
+
+    // Write empty NDEF (NLEN=0) so the phone sees a blank tag
+    if (!ntag424Handler->writeEmptyNDEF()) {
+      Serial.println(F("    ⚠️  NDEF wissen mislukt — SDM-reset wordt toch geprobeerd"));
+      webServer.broadcastWriteCardStatus(uid, "processing", "⚠️ NDEF wissen mislukt");
+    } else {
+      Serial.println(F("    ✅ NDEF leeg gemaakt (geen trigger meer voor telefoons)"));
+      webServer.broadcastWriteCardStatus(uid, "processing", "✅ NDEF gewist");
+    }
+
+    // Disable SDM (ChangeFileSettings with SDM=off)
+    if (ntag424Handler->disableSDM()) {
+      Serial.println(F("    ✅ SDM uitgeschakeld"));
+      webServer.broadcastWriteCardStatus(uid, "processing", "✅ SDM uitgeschakeld");
+    } else {
+      Serial.println(F("    ⚠️  SDM uitschakelen mislukt — kaart mogelijk al zonder SDM"));
+      webServer.broadcastWriteCardStatus(uid, "processing", "⚠️ SDM al uitgeschakeld of reset mislukt");
+    }
+  }
+
   if (!resetToFactory && ndefWriteMode == "keys_and_ndef") {
     Serial.println(F("\n[9] WRITE NDEF URL (keys_and_ndef mode)"));
     Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
@@ -1448,7 +1472,7 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("║     ✅ CARD WRITE COMPLETE! ✅            ║"));
   Serial.println(F("╚═══════════════════════════════════════════╝"));
   if (resetToFactory) {
-    webServer.broadcastWriteCardStatus(uid, "success", "Kaart gereset naar factory state (K0 = 00...00)!");
+    webServer.broadcastWriteCardStatus(uid, "success", "Kaart volledig gereset naar factory state (K0 = 00...00, NDEF + SDM gewist)!");
   } else {
     webServer.broadcastWriteCardStatus(uid, "success", "Kaart succesvol geschreven en volledig geverifieerd!");
   }

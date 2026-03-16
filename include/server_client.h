@@ -143,6 +143,23 @@ public:
     }
 
     /**
+     * Quick check whether the server still recognises this reader's token.
+     * Sends GET /api/challenge/initial with reader-auth headers.
+     * Returns the raw HTTP status code: 200=registered, 401=removed/unknown, <0=unreachable.
+     */
+    int checkReaderRegistration() {
+        if (serverUrl.isEmpty() || readerToken.isEmpty()) return -1;
+        HTTPClient hc;
+        hc.begin(serverUrl + "/api/challenge/initial");
+        hc.setTimeout(3000);
+        if (readerId.length() > 0) hc.addHeader("X-Reader-Id", readerId);
+        hc.addHeader("X-Reader-Token", readerToken);
+        int code = hc.GET();
+        hc.end();
+        return code;
+    }
+
+    /**
      * Call from loop().  Only fires when PING_INTERVAL has elapsed.
      * Pass requestChallenge=true when the cached nonce is stale/absent so
      * the server issues a fresh one in the same response.

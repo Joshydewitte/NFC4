@@ -144,6 +144,13 @@ public:
      */
     bool writeNDEF(const String& url);
 
+    /**
+     * Write NLEN=0 to the NDEF file, marking it as empty/unconfigured.
+     * Phones will not trigger any action when tapping the card.
+     * Used during factory reset.
+     */
+    bool writeEmptyNDEF();
+
     // ── SDM (Secure Dynamic Messaging) ─────────────────────────────────────────
     // After setupSDM() is called once (requires auth), every subsequent tap can be
     // authenticated with a single ReadData APDU — no 3-way handshake needed.
@@ -178,6 +185,14 @@ public:
      * @return true on success
      */
     bool setupSDM();
+
+    /**
+     * Disable SDM on NDEF file (File 02). Requires prior authenticateEV2First().
+     * Sends ChangeFileSettings with FileOption=0x00 (plain, no SDM).
+     * Used during factory reset to undo any SDM configuration.
+     * @return true on success
+     */
+    bool disableSDM();
 
     /**
      * Read SDM data (UID + counter + CMAC) in a single ReadData APDU.
