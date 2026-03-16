@@ -241,6 +241,17 @@ const char CONFIG_CARD_PAGE[] PROGMEM = R"rawliteral(
         .log-level-warning { color: #ffa500; }
         .log-level-error { color: #f44336; }
     </style>
+    <script>
+        (function(){
+            const _fetch = window.fetch.bind(window);
+            window.fetch = function(url, opts){
+                return _fetch(url, opts).then(function(r){
+                    if(r.status === 401){ window.location.replace('/login'); }
+                    return r;
+                });
+            };
+        })();
+    </script>
 </head>
 <body>
     <div class="header">

@@ -136,7 +136,7 @@ private:
         
         // Settings page
         httpServer.on("/settings", HTTP_GET, [this]() {
-            if (!requireAuth()) return;
+            if (!requireAuthPage()) return;
             handleSettingsPage();
         });
         
@@ -260,7 +260,7 @@ private:
         
         // Config card personalization page
         httpServer.on("/config-card", HTTP_GET, [this]() {
-            if (!requireAuth()) return;
+            if (!requireAuthPage()) return;
             httpServer.send(200, "text/html", CONFIG_CARD_PAGE);
         });
         
@@ -278,7 +278,7 @@ private:
         
         // Write cards page
         httpServer.on("/write-cards", HTTP_GET, [this]() {
-            if (!requireAuth()) return;
+            if (!requireAuthPage()) return;
             httpServer.send(200, "text/html", WRITE_CARDS_PAGE);
         });
         
@@ -356,6 +356,17 @@ private:
             return false;
         }
         // Refresh session
+        sessionExpiry = millis() + SESSION_TIMEOUT;
+        return true;
+    }
+
+    // For HTML page routes: redirect to /login instead of returning JSON 401
+    bool requireAuthPage() {
+        if (!isAuthenticated()) {
+            httpServer.sendHeader("Location", "/login");
+            httpServer.send(302);
+            return false;
+        }
         sessionExpiry = millis() + SESSION_TIMEOUT;
         return true;
     }

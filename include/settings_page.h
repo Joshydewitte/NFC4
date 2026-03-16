@@ -155,6 +155,17 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
             color: #721c24;
         }
     </style>
+    <script>
+        (function(){
+            const _fetch = window.fetch.bind(window);
+            window.fetch = function(url, opts){
+                return _fetch(url, opts).then(function(r){
+                    if(r.status === 401){ window.location.replace('/login'); }
+                    return r;
+                });
+            };
+        })();
+    </script>
 </head>
 <body>
     <div class="header">

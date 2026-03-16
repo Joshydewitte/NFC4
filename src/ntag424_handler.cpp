@@ -1182,7 +1182,11 @@ bool NTAG424Handler::setupSDM() {
                 }
                 commandCounter++;
             } else {
-                logDebug("GFS File02 failed SW=0x" + String(lastStatusWord, HEX));
+                // Even on failure the card may have incremented its counter for
+                // authenticated commands (SW=91AE means it processed the MAC).
+                // Always increment to stay in sync.
+                commandCounter++;
+                logDebug("GFS File02 failed SW=0x" + String(lastStatusWord, HEX) + " — counter incremented for sync");
             }
         }
     }
@@ -1315,30 +1319,56 @@ NTAG424Handler::SDMData NTAG424Handler::readSDMData() {
     SDMData data;
     data.valid = false;
 
-    // ReadData: [INS=0xAD][FileNo=0x02][Offset(3LE)][Length(3LE)]
-    // Layout in file (file-relative offsets):
-    //   [62..75]  = UID  (14 ASCII hex chars, UIDOffset=62)
-    //   [76]      = gap  (1 char)
-    //   [77..82]  = CTR  (6  ASCII hex chars, CTROff=77)
-    //   [83]      = gap  (1 char)
-    //   [84..99]  = MAC  (16 ASCII hex chars, MACOff=84)
-    //   [100..103]= trailing (not mirrored)
-    // Read 38 bytes: 14+1+6+1+16 = 38 bytes starting from UIDOffset.
-    if (sdmUidOffset == 0) {
-        logDebug("readSDMData: sdmUidOffset not set");
-        return data;
+    // ── Step 1: derive SDM offset dynamically from the NDEF header ───────────
+    // writeNDEF() always builds: [NLEN(2)][0xD1][typeLen=01][payloadLen][U][uriId][urlBody][sep(4)][SDM(38+4)]
+    // payloadLen = 1(uriId) + shortUrlLen + 4("?sv=") + 38(UID+CTR+MAC+gaps) + 4(trailing)
+    //           = shortUrlLen + 47
+    // sdmUidOffset = 7(header) + shortUrlLen + 4(sep) = payloadLen - 36
+    //
+    // Reading 5 bytes from offset 0 (always before the SDM mirror region) gives us
+    // payloadLen at byte[4] without needing any stored state. This allows cards with
+    // different URL lengths to coexist on the same reader.
+    uint16_t dynamicUidOffset;
+    {
+        uint8_t hdrCmd[8] = {0xAD, 0x02, 0x00, 0x00, 0x00, 5, 0x00, 0x00};
+        uint8_t hdrRsp[16];
+        size_t  hdrLen = sizeof(hdrRsp);
+        if (!sendCommand(hdrCmd, 8, hdrRsp, hdrLen) || hdrLen < 5) {
+            logDebug("readSDMData: NDEF header read failed (len=" + String(hdrLen) + ")");
+            return data;
+        }
+        uint8_t payloadByte = hdrRsp[4];
+        if (payloadByte < 47) {
+            // URL would have zero or negative length — NDEF not written or wrong format
+            logDebug("readSDMData: payloadLen=" + String(payloadByte) + " too small");
+            return data;
+        }
+        dynamicUidOffset = (uint16_t)payloadByte - 36;
+        if (dynamicUidOffset < 8 || dynamicUidOffset > 230) {
+            logDebug("readSDMData: implausible uidOffset=" + String(dynamicUidOffset));
+            return data;
+        }
+        if (sdmUidOffset != 0 && sdmUidOffset != dynamicUidOffset) {
+            logDebug("readSDMData: offset corrected from " + String(sdmUidOffset)
+                   + " → " + String(dynamicUidOffset) + " (different URL length on card)");
+        }
+        logDebug("readSDMData: payloadLen=" + String(payloadByte)
+               + " → uidOffset=" + String(dynamicUidOffset));
     }
+
+    // ── Step 2: read 38 bytes of SDM mirror data ─────────────────────────────
+    // Layout: [UID 14][gap 1][CTR 6][gap 1][MAC 16] = 38 chars
     uint8_t cmd[8];
     cmd[0] = 0xAD; // ReadData
     cmd[1] = 0x02; // NDEF file
-    cmd[2] =  sdmUidOffset & 0xFF;
-    cmd[3] = (sdmUidOffset >> 8) & 0xFF;
+    cmd[2] =  dynamicUidOffset & 0xFF;
+    cmd[3] = (dynamicUidOffset >> 8) & 0xFF;
     cmd[4] = 0x00;
     cmd[5] = 38;   // 14(UID) + 1(gap) + 6(CTR) + 1(gap) + 16(MAC)
     cmd[6] = 0x00;
     cmd[7] = 0x00;
 
-    logDebug("readSDMData offset=0x" + String(sdmUidOffset, HEX) + " len=38");
+    logDebug("readSDMData offset=" + String(dynamicUidOffset) + " len=38");
 
     uint8_t response[48];
     size_t responseLen = sizeof(response);

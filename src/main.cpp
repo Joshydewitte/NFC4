@@ -1080,8 +1080,12 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
     // Set up SDM immediately after writing NDEF; offsets are now valid in handler.
     if (ntag424Handler->setupSDM()) {
       Serial.println(F("    ⚡ SDM geconfigureerd"));
+      webServer.broadcastLog("⚡ SDM offsets bijgewerkt voor nieuwe URL", "success");
     } else {
-      Serial.println(F("    ⚠️ SDM configuratie mislukt (niet fataal)"));
+      Serial.println(F("    ❌ SDM configuratie mislukt na URL schrijven!"));
+      webServer.broadcastWriteCardStatus(uid, "error", "URL geschreven maar SDM kon niet worden geconfigureerd — kaart werkt alleen nog via challenge. Schrijf opnieuw met 'Sleutels + URL' modus.");
+      ntag424Handler->resetSession();
+      return;
     }
 
     if (systemConfig.isSingleWriteMode()) {
@@ -1432,7 +1436,10 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
         Serial.println(F("    ⚡ SDM geconfigureerd"));
         webServer.broadcastWriteCardStatus(uid, "processing", "⚡ SDM ingeschakeld");
       } else {
-        Serial.println(F("    ⚠️ SDM configuratie mislukt (niet fataal)"));
+        Serial.println(F("    ❌ SDM configuratie mislukt na URL schrijven!"));
+        webServer.broadcastWriteCardStatus(uid, "error", "URL geschreven maar SDM niet geconfigureerd — gebruik 'Sleutels + URL' modus voor een volledig herstel.");
+        ntag424Handler->resetSession();
+        return;
       }
     }  // end if (urlTemplate.length() > 0)
   }  // end if (ndefWriteMode == "keys_and_ndef")
