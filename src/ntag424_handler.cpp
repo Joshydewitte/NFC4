@@ -6,7 +6,19 @@
 // When true: Prepare all crypto but DON'T write to card
 // Show all debug output for verification before enabling real writes
 #define DEBUG_WRITE_MODE false  // ✅ REAL WRITES ENABLED
+
+// Set to 1 to enable verbose crypto debug output (hex dumps of all
+// intermediate values). Keep 0 in production — each auth step triggers
+// 20+ Serial.println() calls with 32-byte hex strings, costing ~80ms.
+#define NTAG424_VERBOSE_DEBUG 0
 // ====================================
+
+// When VERBOSE_DEBUG is off, replace logDebug() calls with a no-op at the
+// preprocessor level so that argument expressions (bytesToHexString etc.)
+// are also never evaluated — zero runtime overhead.
+#if !NTAG424_VERBOSE_DEBUG
+#define logDebug(x) do {} while(0)
+#endif
 
 // Default factory AES key (all zeros)
 const uint8_t NTAG424Handler::DEFAULT_AES_KEY[16] = {
@@ -88,7 +100,7 @@ bool NTAG424Handler::activateCard() {
             return false;
         }
         
-        delayMicroseconds(500);
+        delayMicroseconds(50);  // same as sendCommand() poll interval
     }
     
     if (!(irqStatus & RX_IRQ_STAT)) {
@@ -2080,8 +2092,18 @@ void NTAG424Handler::logToWeb(const String& message, const String& level) {
     }
 }
 
+// Re-expose the real member function definition after all call sites.
+// The macro above must not interfere with the definition itself.
+#ifdef logDebug
+#undef logDebug
+#endif
+
 void NTAG424Handler::logDebug(const String& message) {
+#if NTAG424_VERBOSE_DEBUG
     Serial.println("[DEBUG] " + message);
+#else
+    (void)message; // suppress unused-parameter warning
+#endif
 }
 
 void NTAG424Handler::logError(const String& message) {

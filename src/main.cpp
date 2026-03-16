@@ -361,193 +361,130 @@ void checkConfigButton() {
 
 void handleMachineMode(NFCReader::CardInfo& cardInfo) {
   Serial.println(F("\n=== MACHINE MODE ==="));
-  webServer.broadcastLog("Machine modus - challenge-response authenticatie", "info");
-  
-  // Check if it's a non-NTAG424 card
-  if (cardInfo.cardType.indexOf("NTAG424") < 0 && 
+
+  // Non-NTAG424 card: forward to server as-is
+  if (cardInfo.cardType.indexOf("NTAG424") < 0 &&
       cardInfo.cardType.indexOf("DESFire") < 0 &&
       cardInfo.cardType.indexOf("SECURE") < 0) {
-    Serial.println(F("⚪ Niet-NTAG424 kaart gedetecteerd"));
-    Serial.print(F("   Type: "));
-    Serial.println(cardInfo.cardType);
     webServer.broadcastLog("⚪ Niet-NTAG424: " + cardInfo.cardType, "info");
-    
-    // Send to server as non-NTAG424
     if (serverClient.isServerOnline()) {
       serverClient.sendScan(cardInfo.uidString, "non_ntag424", cardInfo.cardType);
     }
     return;
   }
-  
-  // Reset handler
+
   if (ntag424Handler == nullptr) {
-    Serial.println(F("❌ NTAG424 handler niet geïnitialiseerd"));
     webServer.broadcastLog("❌ NTAG424 handler niet geïnitialiseerd", "error");
     return;
   }
-  
+
   ntag424Handler->resetSession();
-  
-  // Step 1: Activate card
-  webServer.broadcastLog("Stap 1: Kaart activeren...", "info");
+
+  // Activate card once — reused by both the SDM path and the EV2 fallback
   if (!ntag424Handler->activateCard()) {
-    Serial.println(F("❌ Failed to activate card"));
     webServer.broadcastLog("❌ Kaart activatie mislukt", "error");
     return;
   }
-  
-  Serial.println(F("✅ Card activated"));
-  
-  // Step 2: Get key for this card from server
-  webServer.broadcastLog("Stap 2: Key ophalen van server...", "info");
+
+  // ── SDM fast path ──────────────────────────────────────────────────────────
+  // SDM-configured cards expose UID + counter + CMAC in a single ReadData APDU.
+  // No EV2 handshake needed — server verifies the CMAC (1 HTTP call total).
+  if (serverClient.isServerOnline()) {
+    NTAG424Handler::SDMData sdmData = ntag424Handler->readSDMData();
+    if (sdmData.valid) {
+      String sdmUidHex="", sdmCtrHex="", sdmMacHex="";
+      for (int i=0;i<7;i++){char h[3];sprintf(h,"%02X",sdmData.uid[i]);sdmUidHex+=h;}
+      for (int i=0;i<3;i++){char h[3];sprintf(h,"%02X",sdmData.ctr[i]);sdmCtrHex+=h;}
+      for (int i=0;i<8;i++){char h[3];sprintf(h,"%02X",sdmData.mac[i]);sdmMacHex+=h;}
+      Serial.print(F("   SDM: ")); Serial.print(sdmUidHex.substring(0,8)); Serial.println(F("..."));
+      ServerClient::ScanResult sdmResult = serverClient.sendSDMScan(
+        cardInfo.uidString, sdmUidHex, sdmCtrHex, sdmMacHex
+      );
+      if (sdmResult.success) {
+        webServer.broadcastLog("⚡ SDM authenticatie geslaagd", "success");
+        if (sdmResult.credits > 0)
+          webServer.broadcastLog("💰 Credits: " + String(sdmResult.credits), "success");
+        ntag424Handler->resetSession();
+        return;
+      }
+      Serial.print(F("   SDM fallback: ")); Serial.println(sdmResult.status);
+    }
+  }
+
+  // ── EV2 full authentication ─────────────────────────────────────────────────
+  // Step 1: Fetch derived key for this card UID from server
   String keyHex = serverClient.getCardKey(cardInfo.uidString, "master");
-  
   if (keyHex.length() != 32) {
-    Serial.println(F("❌ No key received from server"));
     webServer.broadcastLog("❌ Geen key van server ontvangen", "error");
+    ntag424Handler->resetSession();
     return;
   }
-  
-  Serial.print(F("✅ Key received: "));
-  Serial.println(keyHex);
-  
-  // Convert key from hex to bytes
+
   uint8_t key[16];
   for (int i = 0; i < 16; i++) {
     char hex[3] = {keyHex[i*2], keyHex[i*2+1], 0};
     key[i] = (uint8_t)strtol(hex, NULL, 16);
   }
-  
-  // Step 3: Authenticate with card
-  webServer.broadcastLog("Stap 3: Authenticeren met kaart...", "info");
-  NTAG424Handler::AuthResult authResult;
-  bool authenticated = ntag424Handler->authenticateEV2First(0, key, authResult);
-  
-  if (!authenticated) {
-    Serial.print(F("❌ Authentication failed: "));
-    Serial.println(authResult.errorMessage);
-    webServer.broadcastLog("❌ Authenticatie mislukt: " + authResult.errorMessage, "error");
-    return;
-  }
-  
-  Serial.println(F("✅ Authentication successful"));
-  
-  // Step 4: Request challenge from server (this will be our RndA)
-  webServer.broadcastLog("Stap 4: Challenge opvragen van server...", "info");
+
+  // Step 2: Get a card-specific nonce from server (this becomes our RndA)
   String serverChallenge = serverClient.requestChallenge(cardInfo.uidString);
-  
-  if (serverChallenge.length() != 32) {  // Must be 32 hex chars = 16 bytes
-    Serial.println(F("❌ Invalid challenge received from server"));
+  if (serverChallenge.length() != 32) {
     webServer.broadcastLog("❌ Ongeldige challenge van server", "error");
+    ntag424Handler->resetSession();
     return;
   }
-  
-  Serial.print(F("✅ Challenge ontvangen: "));
-  Serial.println(serverChallenge);
-  webServer.broadcastLog("Challenge: " + serverChallenge.substring(0, 16) + "...", "success");
-  
-  // Convert challenge from hex to bytes (this will be our RndA)
+
   uint8_t externalRndA[16];
   for (int i = 0; i < 16; i++) {
     char hex[3] = {serverChallenge[i*2], serverChallenge[i*2+1], 0};
     externalRndA[i] = (uint8_t)strtol(hex, NULL, 16);
   }
-  
-  // Step 5: Re-authenticate with card using server's RndA
-  webServer.broadcastLog("Stap 5: Re-authenticeren met server's RndA...", "info");
-  ntag424Handler->resetSession();  // Reset before re-auth
-  
+
+  // Step 3: Single EV2 auth — card is already activated above, no re-init needed
   NTAG424Handler::AuthResult cryptoResult;
-  authenticated = ntag424Handler->authenticateEV2First(0, key, externalRndA, cryptoResult);
-  
-  if (!authenticated) {
-    Serial.print(F("❌ Crypto authentication failed: "));
-    Serial.println(cryptoResult.errorMessage);
-    webServer.broadcastLog("❌ Crypto authenticatie mislukt: " + cryptoResult.errorMessage, "error");
+  bool authOk = ntag424Handler->authenticateEV2First(0, key, externalRndA, cryptoResult);
+  if (!authOk) {
+    webServer.broadcastLog("❌ Authenticatie mislukt: " + cryptoResult.errorMessage, "error");
+    ntag424Handler->resetSession();
     return;
   }
-  
-  Serial.println(F("✅ Crypto authentication successful"));
-  
-  // Step 6: Extract crypto parameters for server verification
-  webServer.broadcastLog("Stap 6: Crypto parameters extraheren...", "info");
-  
-  // Convert encrypted RndB to hex string
-  String encRndBHex = "";
-  for (int i = 0; i < 16; i++) {
-    char hex[3];
-    sprintf(hex, "%02X", cryptoResult.encryptedRndB[i]);
-    encRndBHex += hex;
-  }
-  
-  // Convert encrypted response (from card) to hex string
-  String responseHex = "";
-  for (int i = 0; i < 32; i++) {
-    char hex[3];
-    sprintf(hex, "%02X", cryptoResult.encryptedResponse[i]);
-    responseHex += hex;
-  }
-  
-  // Convert TI to hex string
-  String tiHex = "";
-  for (int i = 0; i < 4; i++) {
-    char hex[3];
-    sprintf(hex, "%02X", cryptoResult.transactionId[i]);
-    tiHex += hex;
-  }
-  
-  Serial.print(F("Encrypted RndB: "));
-  Serial.println(encRndBHex);
-  Serial.print(F("Encrypted Response (from card): "));
-  Serial.println(responseHex);
-  Serial.print(F("Transaction ID: "));
-  Serial.println(tiHex);
-  
-  webServer.broadcastLog("RndB (enc): " + encRndBHex.substring(0, 16) + "...", "info");
-  webServer.broadcastLog("Response: " + responseHex.substring(0, 16) + "...", "info");
-  webServer.broadcastLog("TI: " + tiHex, "info");
-  
-  // Step 8: Verify with server using FULL CRYPTO MODE
-  webServer.broadcastLog("Stap 8: Verificatie bij server (CRYPTO MODE)...", "info");
+
+  // Step 4: Build hex strings and verify with server
+  String encRndBHex="", responseHex="", tiHex="";
+  for (int i=0;i<16;i++){char h[3];sprintf(h,"%02X",cryptoResult.encryptedRndB[i]);   encRndBHex+=h;}
+  for (int i=0;i<32;i++){char h[3];sprintf(h,"%02X",cryptoResult.encryptedResponse[i]);responseHex+=h;}
+  for (int i=0;i<4; i++){char h[3];sprintf(h,"%02X",cryptoResult.transactionId[i]);   tiHex+=h;}
+
   bool verified = serverClient.verifyResponse(cardInfo.uidString, responseHex, encRndBHex, tiHex);
-  
+
   if (verified) {
-    Serial.println(F("✅ ACCESS GRANTED - Cryptographic verification successful"));
-    webServer.broadcastLog("✅ TOEGANG VERLEEND - Cryptografische verificatie succesvol", "success");
+    Serial.println(F("✅ TOEGANG VERLEEND"));
+    webServer.broadcastLog("✅ TOEGANG VERLEEND", "success");
   } else {
-    Serial.println(F("❌ ACCESS DENIED - Cryptographic verification failed"));
-    webServer.broadcastLog("❌ TOEGANG GEWEIGERD - Cryptografische verificatie mislukt", "error");
+    Serial.println(F("❌ TOEGANG GEWEIGERD"));
+    webServer.broadcastLog("❌ TOEGANG GEWEIGERD", "error");
   }
-  
-  // Reset for next card
+
   ntag424Handler->resetSession();
 }
 
 // ============ CONFIG MODE HANDLER ============
 
 void handleConfigMode(NFCReader::CardInfo& cardInfo) {
-  Serial.println(F("\n=== CONFIG MODE - READ ONLY ==="));
-  Serial.println(F("⚠️  CONFIG MODE DOES NOT WRITE TO CARDS!"));
-  Serial.println(F("⚠️  Use WRITE MODE via /write-cards to write cards!"));
-  webServer.broadcastLog("📖 Config modus - Alleen lezen (gebruik /write-cards om te schrijven)", "info");
-  
+  Serial.println(F("\n=== CONFIG MODE ==="));
+
   // Reset any previous ISO-DEP session
   if (ntag424Handler != nullptr) {
     ntag424Handler->resetSession();
   }
-  
-  // Check if it's actually an NTAG424 DNA card
-  if (cardInfo.cardType.indexOf("NTAG424") < 0 && 
+
+  // Non-NTAG424 card: forward to server and return
+  if (cardInfo.cardType.indexOf("NTAG424") < 0 &&
       cardInfo.cardType.indexOf("DESFire") < 0 &&
       cardInfo.cardType.indexOf("SECURE") < 0) {
-    Serial.println(F("⚪ Niet-NTAG424 kaart gedetecteerd in config mode"));
-    webServer.broadcastLog("⚠️ Geen NTAG424 DNA kaart gedetecteerd", "warning");
-    webServer.broadcastLog("Card type: " + cardInfo.cardType, "info");
-    
-    // Send to server as non-NTAG424
+    webServer.broadcastLog("⚪ Niet-NTAG424: " + cardInfo.cardType, "info");
     if (serverClient.isServerOnline()) {
       serverClient.sendScan(cardInfo.uidString, "non_ntag424", cardInfo.cardType);
-      webServer.broadcastLog("✅ Scan verzonden naar server", "success");
     }
     return;
   }
@@ -857,8 +794,6 @@ void handleConfigMode(NFCReader::CardInfo& cardInfo) {
   // DISPLAY INFO
   // ═══════════════════════════════════════════════════════════════
   webServer.broadcastLog("✅ Kaart gelezen: " + cardInfo.uidString, "success");
-  webServer.broadcastLog("Type: " + cardInfo.cardType, "info");
-  webServer.broadcastLog("💡 Ga naar /write-cards om deze kaart te schrijven", "info");
   
   // Reset session for next card
   if (ntag424Handler != nullptr) {
@@ -975,48 +910,33 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
     
     String response = http.getString();
     http.end();
-    
-    Serial.print(F("📥 Server response: "));
-    Serial.println(response);
-    
-    // Parse JSON response: {"success":true,"key":"0123456789ABCDEF0123456789ABCDEF"}
-    int keyStart = response.indexOf("\"key\":\"") + 7;
-    int keyEnd = response.indexOf("\"", keyStart);
-    
-    if (keyStart < 7 || keyEnd < 0) {
-      String errorMsg = "Server response bevat geen key";
+
+    // Parse JSON response with ArduinoJson (safe against malformed input)
+    StaticJsonDocument<256> keyDoc;
+    if (deserializeJson(keyDoc, response) || !keyDoc.containsKey("key")) {
+      webServer.broadcastWriteCardStatus(uid, "error", "Server response bevat geen key");
       Serial.println(F("❌ Invalid server response (no key field)"));
-      webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
       return;
     }
-    
-    String keyHex = response.substring(keyStart, keyEnd);
-    
+
+    String keyHex = keyDoc["key"].as<String>();
+
     if (keyHex.length() != 32) {
-      String errorMsg = "Server key is niet 32 hex chars (16 bytes)";
+      webServer.broadcastWriteCardStatus(uid, "error", "Server key is niet 32 hex chars (16 bytes)");
       Serial.print(F("❌ Invalid key length from server: "));
       Serial.println(keyHex.length());
-      webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
       return;
     }
-    
+
     // Convert hex string to bytes
     size_t keyLen = NTAG424Crypto::hexStringToBytes(keyHex, derivedKey, 16);
     if (keyLen != 16) {
-      String errorMsg = "Server key conversie mislukt";
+      webServer.broadcastWriteCardStatus(uid, "error", "Server key conversie mislukt");
       Serial.println(F("❌ Key conversion from hex failed"));
-      webServer.broadcastWriteCardStatus(uid, "error", errorMsg);
       return;
     }
-    
+
     Serial.println(F("✅ Key received from server"));
-    Serial.print(F("Server K0: "));
-    for (int i = 0; i < 16; i++) {
-      char buf[3];
-      sprintf(buf, "%02X", derivedKey[i]);
-      Serial.print(buf);
-    }
-    Serial.println();
     
   } else {
     String errorMsg = "Onbekende key source: " + keySource;
