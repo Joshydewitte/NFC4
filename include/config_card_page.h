@@ -327,7 +327,7 @@ const char CONFIG_CARD_PAGE[] PROGMEM = R"rawliteral(
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const hostname = window.location.hostname;
-            const wsUrl = protocol + '//' + hostname + ':81/';
+            const wsUrl = protocol + '//' + hostname + '/ws';
             
             ws = new WebSocket(wsUrl);
             

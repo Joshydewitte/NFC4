@@ -2,7 +2,7 @@
 #define WIFI_MANAGER_H
 
 #include <WiFi.h>
-#include <WebServer.h>
+#include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include "config_page.h"
@@ -11,7 +11,7 @@
 
 class WiFiConfigManager {
 private:
-    WebServer server;
+    AsyncWebServer server;
     DNSServer dnsServer;
     Preferences preferences;
     
@@ -22,6 +22,11 @@ private:
     bool configMode = false;
     String connectedSSID = "";
     IPAddress stationIP;
+
+    // Pending WiFi connect (scheduled from handleConnect, executed in loop)
+    bool pendingConnect = false;
+    String pendingSSID = "";
+    String pendingPassword = "";
     
     // Callback functie wanneer verbinding succesvol is
     void (*onConnectedCallback)() = nullptr;
@@ -89,55 +94,56 @@ public:
     
     void setupWebServer() {
         // Root en captive portal redirects
-        server.on("/", HTTP_GET, [this]() {
-            this->handleRoot();
+        server.on("/", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            this->handleRoot(request);
         });
         
-        server.on("/generate_204", HTTP_GET, [this]() {
-            this->handleRoot();  // Android captive portal
+        server.on("/generate_204", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            this->handleRoot(request);  // Android captive portal
         });
         
-        server.on("/hotspot-detect.html", HTTP_GET, [this]() {
-            this->handleRoot();  // iOS captive portal
+        server.on("/hotspot-detect.html", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            this->handleRoot(request);  // iOS captive portal
         });
         
-        server.on("/canonical.html", HTTP_GET, [this]() {
-            this->handleRoot();  // Firefox captive portal
+        server.on("/canonical.html", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            this->handleRoot(request);  // Firefox captive portal
         });
         
-        server.on("/success.txt", HTTP_GET, [this]() {
-            this->handleRoot();  // Windows captive portal
+        server.on("/success.txt", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            this->handleRoot(request);  // Windows captive portal
         });
         
         // WiFi scan endpoint
-        server.on("/scan", HTTP_GET, [this]() {
-            this->handleScan();
+        server.on("/scan", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            this->handleScan(request);
         });
         
         // Connect endpoint
-        server.on("/connect", HTTP_POST, [this]() {
-            this->handleConnect();
+        server.on("/connect", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            this->handleConnect(request);
         });
         
         // Status endpoint
-        server.on("/status", HTTP_GET, [this]() {
-            this->handleStatus();
+        server.on("/status", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            this->handleStatus(request);
         });
         
         // Catch-all voor captive portal
-        server.onNotFound([this]() {
-            this->handleRoot();
+        server.onNotFound([this](AsyncWebServerRequest* request) {
+            this->handleRoot(request);
         });
     }
     
-    void handleRoot() {
-        server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        server.sendHeader("Pragma", "no-cache");
-        server.sendHeader("Expires", "-1");
-        server.send(200, "text/html", CONFIG_PAGE);
+    void handleRoot(AsyncWebServerRequest* request) {
+        AsyncWebServerResponse* resp = request->beginResponse(200, "text/html", CONFIG_PAGE);
+        resp->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        resp->addHeader("Pragma", "no-cache");
+        resp->addHeader("Expires", "-1");
+        request->send(resp);
     }
     
-    void handleScan() {
+    void handleScan(AsyncWebServerRequest* request) {
         Serial.println(F("WiFi scan gestart..."));
         int n = WiFi.scanNetworks();
         
@@ -181,22 +187,22 @@ public:
         Serial.print(F("Gevonden netwerken: "));
         Serial.println(n);
         
-        server.send(200, "application/json", json);
+        request->send(200, "application/json", json);
         WiFi.scanDelete();
     }
     
-    void handleConnect() {
-        String ssid = server.arg("ssid");
-        String password = server.arg("password");
+    void handleConnect(AsyncWebServerRequest* request) {
+        String ssid = request->arg("ssid");
+        String password = request->arg("password");
         
         Serial.println(F("\n=== Verbinding maken ==="));
         Serial.print(F("SSID: "));
         Serial.println(ssid);
         
-        // Toon connecting pagina
+        // Stuur connecting pagina direct terug
         String connectingPage = CONNECTING_PAGE;
         connectingPage.replace("%SSID%", ssid);
-        server.send(200, "text/html", connectingPage);
+        request->send(200, "text/html", connectingPage);
         
         // Sla credentials op
         preferences.begin("wifi-config", false);
@@ -204,31 +210,21 @@ public:
         preferences.putString("password", password);
         preferences.end();
         
-        // Kleine delay zodat pagina verzonden wordt
-        delay(1000);
-        
-        // Probeer te verbinden
-        if (connectToWiFi(ssid, password)) {
-            connectedSSID = ssid;
-            stationIP = WiFi.localIP();
-            Serial.println(F("✅ Verbinding succesvol!"));
-            Serial.print(F("IP: "));
-            Serial.println(stationIP);
-        } else {
-            Serial.println(F("❌ Verbinding mislukt"));
-        }
+        // Schedule verbinding vanuit de main loop (blocking connect niet in async handler)
+        pendingSSID = ssid;
+        pendingPassword = password;
+        pendingConnect = true;
     }
     
-    void handleStatus() {
+    void handleStatus(AsyncWebServerRequest* request) {
         if (WiFi.status() == WL_CONNECTED && stationIP[0] != 0) {
             // Succespagina tonen
             String successPage = SUCCESS_PAGE;
             successPage.replace("%IP_ADDRESS%", stationIP.toString());
             successPage.replace("%SSID%", connectedSSID);
-            server.send(200, "text/html", successPage);
+            request->send(200, "text/html", successPage);
             
-            // Stop configuratie modus na 5 seconden
-            delay(5000);
+            // Stop configuratie modus (server blijft actief maar AP wordt afgebroken)
             stopConfigMode();
             
             // Roep callback aan
@@ -237,7 +233,7 @@ public:
             }
         } else {
             // Nog aan het verbinden
-            server.send(200, "text/html", "<html><body><h1>Nog aan het verbinden...</h1><script>setTimeout(function(){window.location.href='/status';}, 2000);</script></body></html>");
+            request->send(200, "text/html", "<html><body><h1>Nog aan het verbinden...</h1><script>setTimeout(function(){window.location.href='/status';}, 2000);</script></body></html>");
         }
     }
     
@@ -261,7 +257,7 @@ public:
         if (configMode) {
             Serial.println(F("Stop configuratie modus"));
             dnsServer.stop();
-            server.stop();
+            // AsyncWebServer has no stop() — AP teardown makes it unreachable
             WiFi.softAPdisconnect(true);
             configMode = false;
         }
@@ -270,7 +266,19 @@ public:
     void loop() {
         if (configMode) {
             dnsServer.processNextRequest();
-            server.handleClient();
+            // Execute pending WiFi connection from main loop (avoids blocking async task)
+            if (pendingConnect) {
+                pendingConnect = false;
+                if (connectToWiFi(pendingSSID, pendingPassword)) {
+                    connectedSSID = pendingSSID;
+                    stationIP = WiFi.localIP();
+                    Serial.println(F("✅ Verbinding succesvol!"));
+                    Serial.print(F("IP: "));
+                    Serial.println(stationIP);
+                } else {
+                    Serial.println(F("❌ Verbinding mislukt"));
+                }
+            }
         }
     }
     

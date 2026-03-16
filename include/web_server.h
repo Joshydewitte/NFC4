@@ -1,8 +1,7 @@
 #ifndef WEB_SERVER_H
 #define WEB_SERVER_H
 
-#include <WebServer.h>
-#include <WebSocketsServer.h>
+#include <ESPAsyncWebServer.h>
 #include "system_config.h"
 
 // Forward declaration
@@ -21,8 +20,8 @@ void webServerBroadcastLog(class NFCWebServer* ws, const String& message, const 
 
 class NFCWebServer {
 private:
-    WebServer httpServer;
-    WebSocketsServer wsServer;
+    AsyncWebServer httpServer;
+    AsyncWebSocket ws;
     SystemConfig* config;
     ServerClient* serverClient;
     
@@ -32,7 +31,7 @@ private:
     const unsigned long SESSION_TIMEOUT = 3600000; // 1 uur
     
 public:
-    NFCWebServer() : httpServer(80), wsServer(81) {}
+    NFCWebServer() : httpServer(80), ws("/ws") {}
     
     void begin(SystemConfig* cfg, ServerClient* srv) {
         config = cfg;
@@ -40,31 +39,48 @@ public:
         
         Serial.println(F("Starting Web Server..."));
         
-        // IMPORTANT: Tell WebServer to collect Cookie header
-        const char* headerKeys[] = {"Cookie"};
-        httpServer.collectHeaders(headerKeys, 1);
-        
-        setupRoutes();
-        httpServer.begin();
-        wsServer.begin();
-        wsServer.onEvent([this](uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-            this->handleWebSocketEvent(num, type, payload, length);
+        // Capture full POST body into request->_tempObject for all POST routes.
+        // AsyncWebServerRequest destructor frees _tempObject automatically.
+        httpServer.onRequestBody([](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+            if (index == 0) {
+                if (request->_tempObject) free(request->_tempObject);
+                request->_tempObject = malloc(total + 1);
+                ((uint8_t*)request->_tempObject)[total] = 0;
+            }
+            if (request->_tempObject) {
+                memcpy((uint8_t*)request->_tempObject + index, data, len);
+            }
         });
-        
+
+        setupRoutes();
+
+        // WebSocket served at ws://<ip>/ws (port 80) — no separate port needed.
+        // mathieucarbou ESPAsyncWebServer uses an internal mutex in textAll(),
+        // making it safe to call broadcastLog() from Core 1 (loop) while
+        // AsyncTCP processes events on Core 0.
+        ws.onEvent([this](AsyncWebSocket* server, AsyncWebSocketClient* client,
+                          AwsEventType type, void* arg, uint8_t* data, size_t len) {
+            handleWebSocketEvent(server, client, type, arg, data, len);
+        });
+        httpServer.addHandler(&ws);
+
+        httpServer.begin();
+
         Serial.println(F("✅ Web Server active on port 80"));
-        Serial.println(F("✅ WebSocket Server active on port 81"));
+        Serial.println(F("✅ WebSocket active at ws://<ip>/ws"));
     }
     
     void loop() {
-        httpServer.handleClient();
-        wsServer.loop();
+        // Release memory from disconnected WebSocket clients to prevent leaks.
+        // HTTP + WS processing is handled by AsyncTCP on Core 0 — no handleClient() needed.
+        ws.cleanupClients();
     }
     
     // ============ WEBSOCKET LOGGING ============
     
     void broadcastLog(const String& message, const String& level = "info") {
         String json = "{\"type\":\"log\",\"data\":{\"message\":\"" + message + "\",\"level\":\"" + level + "\"}}";
-        wsServer.broadcastTXT(json);
+        ws.textAll(json);
     }
     
     void broadcastStatus(const String& readerStatus, const String& serverStatus, const String& readerMode) {
@@ -73,7 +89,7 @@ public:
         json += "\"serverStatus\":\"" + serverStatus + "\",";
         json += "\"readerMode\":\"" + readerMode + "\"";
         json += "}}";
-        wsServer.broadcastTXT(json);
+        ws.textAll(json);
     }
     
     void broadcastStats(uint32_t cardsRead, unsigned long uptime) {
@@ -81,12 +97,12 @@ public:
         json += "\"cardsRead\":" + String(cardsRead) + ",";
         json += "\"uptime\":" + String(uptime);
         json += "}}";
-        wsServer.broadcastTXT(json);
+        ws.textAll(json);
     }
     
     void broadcastWriteCardStatus(const String& uid, const String& status, const String& message) {
         String json = "{\"type\":\"write_card_status\",\"uid\":\"" + uid + "\",\"status\":\"" + status + "\",\"message\":\"" + message + "\"}";
-        wsServer.broadcastTXT(json);
+        ws.textAll(json);
     }
     
 private:
@@ -94,102 +110,101 @@ private:
         // ============ PUBLIC ROUTES ============
         
         // Root - redirect based on admin setup status
-        httpServer.on("/", HTTP_GET, [this]() {
+        httpServer.on("/", HTTP_GET, [this](AsyncWebServerRequest* request) {
             Serial.println(F("[WEB] GET / requested"));
             
             if (!config->hasAdminAccount()) {
                 Serial.println(F("[WEB] -> Showing admin setup page"));
-                httpServer.send(200, "text/html", ADMIN_SETUP_PAGE);
-            } else if (!isAuthenticated()) {
+                request->send(200, "text/html", ADMIN_SETUP_PAGE);
+            } else if (!isAuthenticated(request)) {
                 Serial.println(F("[WEB] -> Not authenticated, redirecting to /login"));
-                httpServer.sendHeader("Location", "/login");
-                httpServer.send(302);
+                request->redirect("/login");
             } else {
                 Serial.println(F("[WEB] -> Authenticated, showing status page"));
-                httpServer.send(200, "text/html", STATUS_PAGE);
+                request->send(200, "text/html", STATUS_PAGE);
             }
         });
         
         // Login page
-        httpServer.on("/login", HTTP_GET, [this]() {
-            httpServer.send(200, "text/html", LOGIN_PAGE);
+        httpServer.on("/login", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            request->send(200, "text/html", LOGIN_PAGE);
         });
         
         // Admin setup (first time only)
-        httpServer.on("/setup-admin", HTTP_POST, [this]() {
-            handleAdminSetup();
+        httpServer.on("/setup-admin", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            handleAdminSetup(request);
         });
         
         // Login API
-        httpServer.on("/api/login", HTTP_POST, [this]() {
-            handleLogin();
+        httpServer.on("/api/login", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            handleLogin(request);
         });
         
         // Logout API
-        httpServer.on("/api/logout", HTTP_POST, [this]() {
+        httpServer.on("/api/logout", HTTP_POST, [this](AsyncWebServerRequest* request) {
             sessionToken = "";
             sessionExpiry = 0;
-            httpServer.send(200, "application/json", "{\"success\":true}");
+            request->send(200, "application/json", "{\"success\":true}");
         });
         
         // ============ PROTECTED ROUTES ============
         
         // Settings page
-        httpServer.on("/settings", HTTP_GET, [this]() {
-            if (!requireAuthPage()) return;
-            handleSettingsPage();
+        httpServer.on("/settings", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuthPage(request)) return;
+            handleSettingsPage(request);
         });
         
         // Server settings API
-        httpServer.on("/api/settings/server", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleSaveServerSettings();
+        httpServer.on("/api/settings/server", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleSaveServerSettings(request);
         });
         
         // Reader mode API
-        httpServer.on("/api/settings/mode", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleSaveReaderMode();
+        httpServer.on("/api/settings/mode", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleSaveReaderMode(request);
         });
         
         // Masterkey API
-        httpServer.on("/api/settings/masterkey", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleSetMasterkey();
+        httpServer.on("/api/settings/masterkey", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleSetMasterkey(request);
         });
         
         // Clear masterkey API
-        httpServer.on("/api/settings/masterkey/clear", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
+        httpServer.on("/api/settings/masterkey/clear", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
             config->clearSessionMasterkey();
-            httpServer.send(200, "application/json", "{\"success\":true}");
+            request->send(200, "application/json", "{\"success\":true}");
         });
         
         // Network settings API
-        httpServer.on("/api/settings/network", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleSaveNetworkSettings();
+        httpServer.on("/api/settings/network", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleSaveNetworkSettings(request);
         });
 
         // NDEF / URL settings API
-        httpServer.on("/api/settings/ndef", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleSaveNdefSettings();
+        httpServer.on("/api/settings/ndef", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleSaveNdefSettings(request);
         });
 
-        httpServer.on("/api/settings/ndef", HTTP_GET, [this]() {
-            if (!requireAuth()) return;
+        httpServer.on("/api/settings/ndef", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
             String tpl  = config->getNdefUrlTemplate();
             bool   en   = config->isNdefEnabled();
             String mode = config->getNdefWriteMode();
             String json = "{\"urlTemplate\":\"" + tpl + "\",\"enabled\":" +
                           (en ? "true" : "false") + ",\"writeMode\":\"" + mode + "\"}";
-            httpServer.send(200, "application/json", json);
+            request->send(200, "application/json", json);
         });
 
         // Reader info: ID + whether token is configured + whether server still knows us
-        httpServer.on("/api/reader/info", HTTP_GET, [this]() {
-            if (!requireAuth()) return;
+        httpServer.on("/api/reader/info", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
             String rid    = config->deriveReaderId();
             String mac    = WiFi.macAddress();
             bool   hasTok = config->hasReaderToken();
@@ -206,138 +221,129 @@ private:
             String json = "{\"readerId\":\"" + rid + "\",\"mac\":\"" + mac +
                           "\",\"hasToken\":" + (hasTok ? "true" : "false") +
                           ",\"serverStatus\":\"" + serverStatus + "\"}";
-            httpServer.send(200, "application/json", json);
+            request->send(200, "application/json", json);
         });
 
         // Save reader API token
-        httpServer.on("/api/settings/reader-token", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            String body = httpServer.arg("plain");
+        httpServer.on("/api/settings/reader-token", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            String body = request->_tempObject ? (char*)request->_tempObject : "";
             JsonDocument doc;
             if (deserializeJson(doc, body) || !doc["token"].is<const char*>()) {
-                httpServer.send(400, "application/json", "{\"error\":\"Missing token\"}");
+                request->send(400, "application/json", "{\"error\":\"Missing token\"}");
                 return;
             }
             String token = doc["token"].as<String>();
             if (token.length() == 0) {
-                httpServer.send(400, "application/json", "{\"error\":\"Token cannot be empty\"}");
+                request->send(400, "application/json", "{\"error\":\"Token cannot be empty\"}");
                 return;
             }
             config->setReaderToken(token);
             if (serverClient) {
                 serverClient->setReaderToken(token);
             }
-            httpServer.send(200, "application/json", "{\"success\":true}");
+            request->send(200, "application/json", "{\"success\":true}");
         });
 
         // System control APIs
-        httpServer.on("/api/reboot", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            httpServer.send(200, "application/json", "{\"success\":true}");
-            delay(1000);
+        httpServer.on("/api/reboot", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            request->send(200, "application/json", "{\"success\":true}");
+            delay(500);
             ESP.restart();
         });
         
-        httpServer.on("/api/reset-network", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
+        httpServer.on("/api/reset-network", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
             config->resetNetwork();
-            httpServer.send(200, "application/json", "{\"success\":true,\"message\":\"Network reset\"}");
+            request->send(200, "application/json", "{\"success\":true,\"message\":\"Network reset\"}");
         });
         
-        httpServer.on("/api/factory-reset", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
+        httpServer.on("/api/factory-reset", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
             config->factoryReset();
-            httpServer.send(200, "application/json", "{\"success\":true,\"message\":\"Factory reset\"}");
-            delay(1000);
+            request->send(200, "application/json", "{\"success\":true,\"message\":\"Factory reset\"}");
+            delay(500);
             ESP.restart();
         });
         
         // Test server connection
-        httpServer.on("/api/test-server", HTTP_GET, [this]() {
-            if (!requireAuth()) return;  
+        httpServer.on("/api/test-server", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
             unsigned long start = millis();
             bool success = serverClient->testConnection();
             unsigned long latency = millis() - start;
             
             String json = "{\"success\":" + String(success ? "true" : "false") + ",\"latency\":" + String(latency) + "}";
-            httpServer.send(200, "application/json", json);
+            request->send(200, "application/json", json);
         });
         
         // Stats API
-        httpServer.on("/api/stats", HTTP_GET, [this]() {
-            if (!requireAuth()) return;
-            handleStatsAPI();
+        httpServer.on("/api/stats", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleStatsAPI(request);
         });
         
         // Config card personalization page
-        httpServer.on("/config-card", HTTP_GET, [this]() {
-            if (!requireAuthPage()) return;
-            httpServer.send(200, "text/html", CONFIG_CARD_PAGE);
+        httpServer.on("/config-card", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuthPage(request)) return;
+            request->send(200, "text/html", CONFIG_CARD_PAGE);
         });
         
         // Get current card API
-        httpServer.on("/api/card/current", HTTP_GET, [this]() {
-            if (!requireAuth()) return;
-            handleGetCurrentCard();
+        httpServer.on("/api/card/current", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleGetCurrentCard(request);
         });
         
         // Start personalization API  
-        httpServer.on("/api/personalize/start", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleStartPersonalization();
+        httpServer.on("/api/personalize/start", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleStartPersonalization(request);
         });
         
         // Write cards page
-        httpServer.on("/write-cards", HTTP_GET, [this]() {
-            if (!requireAuthPage()) return;
-            httpServer.send(200, "text/html", WRITE_CARDS_PAGE);
+        httpServer.on("/write-cards", HTTP_GET, [this](AsyncWebServerRequest* request) {
+            if (!requireAuthPage(request)) return;
+            request->send(200, "text/html", WRITE_CARDS_PAGE);
         });
         
         // Write cards API - Start
-        httpServer.on("/api/write/start", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleWriteStart();
+        httpServer.on("/api/write/start", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleWriteStart(request);
         });
         
         // Write cards API - Stop
-        httpServer.on("/api/write/stop", HTTP_POST, [this]() {
-            if (!requireAuth()) return;
-            handleWriteStop();
+        httpServer.on("/api/write/stop", HTTP_POST, [this](AsyncWebServerRequest* request) {
+            if (!requireAuth(request)) return;
+            handleWriteStop(request);
         });
 
         // Favicon — browsers always request this; serve a minimal response so
         // it never shows as an unhandled 404 in the serial log.
-        httpServer.on("/favicon.ico", HTTP_GET, [this]() {
-            httpServer.send(204); // No Content
-        });
-
-        // /ws on port 80 — browser cache may try WebSocket upgrades here even
-        // though the real WebSocket server is on port 81. Register it explicitly
-        // so the Arduino WebServer doesn't log "request handler not found".
-        httpServer.on("/ws", HTTP_GET, [this]() {
-            httpServer.send(426, "text/plain",
-                "WebSocket server is on port 81. Connect to ws://<ip>:81/");
+        httpServer.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* request) {
+            request->send(204); // No Content
         });
 
         // Catch-all 404 handler — replaces the noisy internal WebServer error log.
-        httpServer.onNotFound([this]() {
-            String method = (httpServer.method() == HTTP_GET) ? "GET" : "POST";
-            String uri    = httpServer.uri();
+        httpServer.onNotFound([this](AsyncWebServerRequest* request) {
+            String method = (request->method() == HTTP_GET) ? "GET" : "POST";
+            String uri    = request->url();
             Serial.println("[WEB] 404 " + method + " " + uri);
             if (uri.startsWith("/api/")) {
-                httpServer.send(404, "application/json",
+                request->send(404, "application/json",
                     "{\"error\":\"Not found\",\"path\":\"" + uri + "\"}");
             } else {
                 // Unknown page — redirect to root so the user lands somewhere useful
-                httpServer.sendHeader("Location", "/");
-                httpServer.send(302);
+                request->redirect("/");
             }
         });
     }
     
     // ============ SESSION MANAGEMENT ============
     
-    bool isAuthenticated() {
+    bool isAuthenticated(AsyncWebServerRequest* request) {
         // Check if session is valid
         if (sessionToken.isEmpty() || millis() > sessionExpiry) {
             Serial.println(F("[AUTH] No valid session token"));
@@ -345,8 +351,8 @@ private:
         }
         
         // Check cookie
-        if (httpServer.hasHeader("Cookie")) {
-            String cookie = httpServer.header("Cookie");
+        if (request->hasHeader("Cookie")) {
+            String cookie = request->getHeader("Cookie")->value();
             Serial.print(F("[AUTH] Cookie received: "));
             Serial.println(cookie);
             Serial.print(F("[AUTH] Expected session: "));
@@ -361,9 +367,9 @@ private:
         return false;
     }
     
-    bool requireAuth() {
-        if (!isAuthenticated()) {
-            httpServer.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    bool requireAuth(AsyncWebServerRequest* request) {
+        if (!isAuthenticated(request)) {
+            request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
             return false;
         }
         // Refresh session
@@ -372,10 +378,9 @@ private:
     }
 
     // For HTML page routes: redirect to /login instead of returning JSON 401
-    bool requireAuthPage() {
-        if (!isAuthenticated()) {
-            httpServer.sendHeader("Location", "/login");
-            httpServer.send(302);
+    bool requireAuthPage(AsyncWebServerRequest* request) {
+        if (!isAuthenticated(request)) {
+            request->redirect("/login");
             return false;
         }
         sessionExpiry = millis() + SESSION_TIMEOUT;
@@ -392,31 +397,31 @@ private:
     
     // ============ HANDLERS ============
     
-    void handleAdminSetup() {
+    void handleAdminSetup(AsyncWebServerRequest* request) {
         if (config->hasAdminAccount()) {
-            httpServer.send(400, "application/json", "{\"success\":false,\"message\":\"Admin already exists\"}");
+            request->send(400, "application/json", "{\"success\":false,\"message\":\"Admin already exists\"}");
             return;
         }
         
-        String username = httpServer.arg("username");
-        String password = httpServer.arg("password");
+        String username = request->arg("username");
+        String password = request->arg("password");
         
         if (username.length() < 4 || password.length() < 8) {
-            httpServer.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid credentials\"}");
+            request->send(400, "application/json", "{\"success\":false,\"message\":\"Invalid credentials\"}");
             return;
         }
         
         bool success = config->createAdminAccount(username, password);
         
         if (success) {
-            httpServer.send(200, "application/json", "{\"success\":true}");
+            request->send(200, "application/json", "{\"success\":true}");
         } else {
-            httpServer.send(500, "application/json", "{\"success\":false,\"message\":\"Failed to create admin\"}");
+            request->send(500, "application/json", "{\"success\":false,\"message\":\"Failed to create admin\"}");
         }
     }
     
-    void handleLogin() {
-        String body = httpServer.arg("plain");
+    void handleLogin(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
         
         // Parse JSON
         int userStart = body.indexOf("\"username\":\"") + 12;
@@ -433,8 +438,10 @@ private:
             
             // Note: HttpOnly removed so JavaScript can set the cookie
             String cookieValue = "session=" + sessionToken + "; Path=/; SameSite=Lax";
-            httpServer.sendHeader("Set-Cookie", cookieValue);
-            httpServer.send(200, "application/json", "{\"success\":true,\"session\":\"" + sessionToken + "\"}");
+            AsyncWebServerResponse* resp = request->beginResponse(200, "application/json",
+                "{\"success\":true,\"session\":\"" + sessionToken + "\"}");
+            resp->addHeader("Set-Cookie", cookieValue);
+            request->send(resp);
             
             Serial.print(F("✅ Admin logged in: "));
             Serial.println(username);
@@ -442,11 +449,11 @@ private:
             Serial.println(sessionToken);
         } else {
             Serial.println(F("❌ Login failed: Invalid credentials"));
-            httpServer.send(401, "application/json", "{\"success\":false,\"message\":\"Invalid credentials\"}");
+            request->send(401, "application/json", "{\"success\":false,\"message\":\"Invalid credentials\"}");
         }
     }
     
-    void handleSettingsPage() {
+    void handleSettingsPage(AsyncWebServerRequest* request) {
         String page = SETTINGS_PAGE;
         
         // Replace placeholders
@@ -482,11 +489,11 @@ private:
         page.replace("%GATEWAY%", config->getGateway());
         page.replace("%SUBNET%", config->getSubnet());
         
-        httpServer.send(200, "text/html", page);
+        request->send(200, "text/html", page);
     }
     
-    void handleSaveServerSettings() {
-        String body = httpServer.arg("plain");
+    void handleSaveServerSettings(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
         int urlStart = body.indexOf("\"url\":\"") + 7;
         int urlEnd = body.indexOf("\"", urlStart);
         String url = body.substring(urlStart, urlEnd);
@@ -498,7 +505,7 @@ private:
         bool connected = serverClient->testConnection();
         
         String json = "{\"success\":true,\"connected\":" + String(connected ? "true" : "false") + "}";
-        httpServer.send(200, "application/json", json);
+        request->send(200, "application/json", json);
         
         Serial.print(F("Server URL saved: "));
         Serial.println(url);
@@ -506,30 +513,30 @@ private:
         Serial.println(connected ? "OK" : "FAILED");
     }
     
-    void handleSaveReaderMode() {
-        String body = httpServer.arg("plain");
+    void handleSaveReaderMode(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
         int modeStart = body.indexOf("\"mode\":\"") + 8;
         int modeEnd = body.indexOf("\"", modeStart);
         String mode = body.substring(modeStart, modeEnd);
         
         config->setReaderMode(mode);
         
-        httpServer.send(200, "application/json", "{\"success\":true}");
+        request->send(200, "application/json", "{\"success\":true}");
     }
     
-    void handleSetMasterkey() {
-        String body = httpServer.arg("plain");
+    void handleSetMasterkey(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
         int keyStart = body.indexOf("\"key\":\"") + 7;
         int keyEnd = body.indexOf("\"", keyStart);
         String key = body.substring(keyStart, keyEnd);
         
         config->setSessionMasterkey(key);
         
-        httpServer.send(200, "application/json", "{\"success\":true}");
+        request->send(200, "application/json", "{\"success\":true}");
     }
     
-    void handleSaveNetworkSettings() {
-        String body = httpServer.arg("plain");
+    void handleSaveNetworkSettings(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
 
         int modeStart = body.indexOf("\"mode\":\"") + 8;
         int modeEnd = body.indexOf("\"", modeStart);
@@ -553,11 +560,11 @@ private:
             config->setStaticIP(ip, gw, sn);
         }
 
-        httpServer.send(200, "application/json", "{\"success\":true}");
+        request->send(200, "application/json", "{\"success\":true}");
     }
 
-    void handleSaveNdefSettings() {
-        String body = httpServer.arg("plain");
+    void handleSaveNdefSettings(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
 
         // urlTemplate
         int tplStart = body.indexOf("\"urlTemplate\":\"") + 15;
@@ -581,11 +588,11 @@ private:
             }
         }
 
-        httpServer.send(200, "application/json", "{\"success\":true}");
+        request->send(200, "application/json", "{\"success\":true}");
         Serial.println(F("[NDEF] Settings saved"));
     }
     
-    void handleStatsAPI() {
+    void handleStatsAPI(AsyncWebServerRequest* request) {
         String json = "{";
         json += "\"readerStatus\":\"online\",";
         json += "\"serverStatus\":\"" + String(serverClient->isServerOnline() ? "online" : "offline") + "\",";
@@ -594,18 +601,18 @@ private:
         json += "\"uptime\":" + String(config->getUptime());
         json += "}";
         
-        httpServer.send(200, "application/json", json);
+        request->send(200, "application/json", json);
     }
     
-    void handleGetCurrentCard() {
+    void handleGetCurrentCard(AsyncWebServerRequest* request) {
         // This will be implemented to return current detected card info
         // For now, return empty
         String json = "{\"present\":false}";
-        httpServer.send(200, "application/json", json);
+        request->send(200, "application/json", json);
     }
     
-    void handleStartPersonalization() {
-        String body = httpServer.arg("plain");
+    void handleStartPersonalization(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
         int uidStart = body.indexOf("\"uid\":\"") + 7;
         int uidEnd = body.indexOf("\"", uidStart);
         String uid = body.substring(uidStart, uidEnd);
@@ -613,11 +620,11 @@ private:
         // Trigger personalization workflow
         // This will be implemented in the next step
         String json = "{\"success\":true,\"message\":\"Personalization started\"}";
-        httpServer.send(200, "application/json", json);
+        request->send(200, "application/json", json);
     }
     
-    void handleWriteStart() {
-        String body = httpServer.arg("plain");
+    void handleWriteStart(AsyncWebServerRequest* request) {
+        String body = request->_tempObject ? (char*)request->_tempObject : "";
         
         Serial.println(F("\n╔═══════════════════════════════════════════╗"));
         Serial.println(F("║       WRITE START REQUEST RECEIVED       ║"));
@@ -695,7 +702,7 @@ private:
         if (keySource != "esp32" && keySource != "server") {
             Serial.println(F("❌ VALIDATION FAILED: Invalid keySource"));
             String json = "{\"success\":false,\"message\":\"Ongeldige key source (moet esp32 of server zijn)\"}";
-            httpServer.send(400, "application/json", json);
+            request->send(400, "application/json", json);
             return;
         }
         Serial.println(F("✓ keySource valid"));
@@ -707,7 +714,7 @@ private:
                 Serial.print(masterSecret.length());
                 Serial.println(F(", expected 32"));
                 String json = "{\"success\":false,\"message\":\"Master secret moet exact 32 hex karakters zijn (16 bytes)\"}";
-                httpServer.send(400, "application/json", json);
+                request->send(400, "application/json", json);
                 return;
             }
             // Validate hex characters
@@ -720,7 +727,7 @@ private:
                     Serial.print(c);
                     Serial.println(F("'"));
                     String json = "{\"success\":false,\"message\":\"Master secret moet alleen hex karakters bevatten (0-9, A-F)\"}";
-                    httpServer.send(400, "application/json", json);
+                    request->send(400, "application/json", json);
                     return;
                 }
             }
@@ -730,7 +737,7 @@ private:
         if (mode != "single" && mode != "continuous") {
             Serial.println(F("❌ VALIDATION FAILED: Invalid mode"));
             String json = "{\"success\":false,\"message\":\"Ongeldige mode (moet single of continuous zijn)\"}";
-            httpServer.send(400, "application/json", json);
+            request->send(400, "application/json", json);
             return;
         }
         Serial.println(F("✓ mode valid"));
@@ -742,7 +749,7 @@ private:
             if (previousKey.length() == 0) {
                 Serial.println(F("❌ VALIDATION FAILED: previousKey is empty"));
                 String json = "{\"success\":false,\"message\":\"Vorige key is verplicht voor niet-factory kaarten\"}";
-                httpServer.send(400, "application/json", json);
+                request->send(400, "application/json", json);
                 return;
             }
             
@@ -751,7 +758,7 @@ private:
                 Serial.print(previousKey.length());
                 Serial.println(F(", expected exactly 32"));
                 String json = "{\"success\":false,\"message\":\"Vorige key moet exact 32 hex karakters zijn (16 bytes)\"}";
-                httpServer.send(400, "application/json", json);
+                request->send(400, "application/json", json);
                 return;
             }
             
@@ -765,7 +772,7 @@ private:
                     Serial.print(c);
                     Serial.println(F("'"));
                     String json = "{\"success\":false,\"message\":\"Vorige key moet alleen hex karakters bevatten (0-9, A-F)\"}";
-                    httpServer.send(400, "application/json", json);
+                    request->send(400, "application/json", json);
                     return;
                 }
             }
@@ -819,13 +826,13 @@ private:
         Serial.println(F("═══════════════════════════════════════════\n"));
         
         String json = "{\"success\":true,\"message\":\"Schrijfproces gestart in " + mode + " modus met " + keySource + " key source\"}";
-        httpServer.send(200, "application/json", json);
+        request->send(200, "application/json", json);
         
         String cardType = isFactory ? "factory" : (resetToFactory ? "factory reset" : "gepersonaliseerd");
         broadcastLog("🚀 Schrijfproces gestart (modus: " + mode + ", source: " + keySource + ", type: " + cardType + ")", "success");
     }
     
-    void handleWriteStop() {
+    void handleWriteStop(AsyncWebServerRequest* request) {
         Serial.println(F("\n╔═══════════════════════════════════════════╗"));
         Serial.println(F("║     WRITE MODE STOPPED FROM WEB UI!      ║"));
         Serial.println(F("╚═══════════════════════════════════════════╝"));
@@ -839,63 +846,64 @@ private:
         config->setKeySource("esp32");  // Reset to default ESP32 mode
         
         String json = "{\"success\":true,\"message\":\"Schrijfproces gestopt\"}";
-        httpServer.send(200, "application/json", json);
+        request->send(200, "application/json", json);
         
         broadcastLog("⏹️ Schrijfproces gestopt (key source reset naar ESP32)", "info");
     }
     
-    void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+    // AsyncWebSocket event handler — runs on Core 0 (AsyncTCP task).
+    // No delay() calls: AsyncWebSocket queues messages internally; sends are fire-and-forget.
+    void handleWebSocketEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
+                              AwsEventType type, void* arg, uint8_t* data, size_t len) {
         switch (type) {
-            case WStype_DISCONNECTED:
-                Serial.printf("WebSocket [%u] Disconnected\n", num);
+            case WS_EVT_DISCONNECT:
+                Serial.printf("WebSocket [%u] Disconnected\n", client->id());
+                break;
+
+            case WS_EVT_ERROR:
+                Serial.printf("WebSocket [%u] Error: %s\n", client->id(), (char*)data);
                 break;
                 
-            case WStype_CONNECTED:
+            case WS_EVT_CONNECT:
                 {
-                    IPAddress ip = wsServer.remoteIP(num);
-                    Serial.printf("WebSocket [%u] Connected from %s\n", num, ip.toString().c_str());
+                    IPAddress ip = client->remoteIP();
+                    Serial.printf("WebSocket [%u] Connected from %s\n", client->id(), ip.toString().c_str());
                     
-                    // Send welcome message
-                    String welcome = "{\"type\":\"log\",\"data\":{\"message\":\"✅ WebSocket connected - reader online\",\"level\":\"success\"}}";
-                    wsServer.sendTXT(num, welcome);
+                    // Send welcome + initial state — no delay() needed, messages are queued
+                    client->text("{\"type\":\"log\",\"data\":{\"message\":\"✅ WebSocket connected - reader online\",\"level\":\"success\"}}");
                     
-                    // Send current status
-                    delay(100); // Small delay to ensure client is ready
                     String statusMsg = "{\"type\":\"status\",\"data\":{";
                     statusMsg += "\"readerStatus\":\"online\",";
                     statusMsg += "\"serverStatus\":\"" + String(serverClient->isServerOnline() ? "online" : "offline") + "\",";
                     statusMsg += "\"readerMode\":\"" + config->getReaderMode() + "\"";
                     statusMsg += "}}";
-                    wsServer.sendTXT(num, statusMsg);
+                    client->text(statusMsg);
                     
-                    // Send initial stats
-                    delay(100);
                     String statsMsg = "{\"type\":\"stats\",\"data\":{";
                     statsMsg += "\"cardsRead\":" + String(config->getCardsRead()) + ",";
                     statsMsg += "\"uptime\":" + String(config->getUptime());
                     statsMsg += "}}";
-                    wsServer.sendTXT(num, statsMsg);
+                    client->text(statsMsg);
                     
-                    // Send log message that system is ready
-                    delay(100);
-                    String readyMsg = "{\"type\":\"log\",\"data\":{\"message\":\"📡 Reader actief - wachtend op kaarten\",\"level\":\"info\"}}";
-                    wsServer.sendTXT(num, readyMsg);
+                    client->text("{\"type\":\"log\",\"data\":{\"message\":\"📡 Reader actief - wachtend op kaarten\",\"level\":\"info\"}}");
                 }
                 break;
                 
-            case WStype_TEXT:
+            case WS_EVT_DATA:
                 {
-                    // Handle incoming text messages
-                    String message = String((char*)payload);
-                    Serial.printf("WebSocket [%u] received: %s\n", num, message.c_str());
-                    
-                    // Parse simple JSON-like messages
-                    if (message.indexOf("\"type\":\"page_leave\"") > 0 || message.indexOf("\"type\":\"page_change\"") > 0) {
-                        Serial.println(F("Page leave detected - checking write mode..."));
-                        if (config->isWriteActive()) {
-                            Serial.println(F("⚠️ User left write page - stopping write mode"));
-                            config->stopWriteMode();
-                            broadcastLog("Write mode gestopt: gebruiker verliet pagina", "warning");
+                    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+                    // Only handle complete, single-frame text messages
+                    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+                        String message = String((char*)data, len);
+                        Serial.printf("WebSocket [%u] received: %s\n", client->id(), message.c_str());
+                        
+                        if (message.indexOf("\"type\":\"page_leave\"") > 0 || message.indexOf("\"type\":\"page_change\"") > 0) {
+                            Serial.println(F("Page leave detected - checking write mode..."));
+                            if (config->isWriteActive()) {
+                                Serial.println(F("⚠️ User left write page - stopping write mode"));
+                                config->stopWriteMode();
+                                broadcastLog("Write mode gestopt: gebruiker verliet pagina", "warning");
+                            }
                         }
                     }
                 }

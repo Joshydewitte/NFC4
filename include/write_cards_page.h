@@ -528,7 +528,7 @@ const char WRITE_CARDS_PAGE[] PROGMEM = R"rawliteral(
 
         // Initialize WebSocket connection
         function initWebSocket() {
-            ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+            ws = new WebSocket((window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.hostname + '/ws');
             
             ws.onopen = function() {
                 addLog('WebSocket verbonden', 'success');
