@@ -1,4 +1,5 @@
 #include "system_config.h"
+#include <WiFi.h>
 
 SystemConfig::SystemConfig() 
     : sessionMasterkey(""),
@@ -18,15 +19,32 @@ SystemConfig::SystemConfig()
 
 void SystemConfig::begin() {
     prefs.begin("system", false);
+    // Seed defaults on first boot so NVS keys exist — prevents noisy
+    // [E][Preferences.cpp] nvs_get_str len fail: NOT_FOUND log spam.
+    if (!prefs.isKey("reader_mode"))  prefs.putString("reader_mode",  "machine");
+    if (!prefs.isKey("net_mode"))     prefs.putString("net_mode",     "dhcp");
+    if (!prefs.isKey("server_url"))   prefs.putString("server_url",   "");
+    if (!prefs.isKey("static_ip"))    prefs.putString("static_ip",    "");
+    if (!prefs.isKey("static_gw"))    prefs.putString("static_gw",    "");
+    if (!prefs.isKey("static_sn"))    prefs.putString("static_sn",    "");
+    if (!prefs.isKey("ndef_url_tpl")) prefs.putString("ndef_url_tpl", "");
+    if (!prefs.isKey("ndef_mode"))    prefs.putString("ndef_mode",    "keys_only");
+    if (!prefs.isKey("reader_id"))    prefs.putString("reader_id",    "");
+    if (!prefs.isKey("reader_token")) prefs.putString("reader_token", "");
+    if (!prefs.isKey("admin_user"))   prefs.putString("admin_user",   "");
+    if (!prefs.isKey("admin_pass"))   prefs.putString("admin_pass",   "");
+    prefs.end();
 }
 
 // ============ ADMIN MANAGEMENT ============
 
 bool SystemConfig::hasAdminAccount() {
     prefs.begin("system", true);
-    bool exists = prefs.isKey("admin_user");
+    String username = prefs.getString("admin_user", "");
     prefs.end();
-    return exists;
+    // Only return true when a valid (≥4 char) username is stored.
+    // An empty/corrupt entry allows the setup page to appear again.
+    return username.length() >= 4;
 }
 
 String SystemConfig::hashPassword(const String& password) {
@@ -485,6 +503,18 @@ void SystemConfig::factoryReset() {
     wifiPrefs.begin("wifi-config", false);
     wifiPrefs.clear();
     wifiPrefs.end();
+
+    // Also erase the Arduino WiFi SDK's own stored credentials so the
+    // ESP does not auto-reconnect to the old network after restart.
+    WiFi.disconnect(true, true);
     
     Serial.println(F("Factory reset completed"));
+}
+
+void SystemConfig::resetAdminAccount() {
+    prefs.begin("system", false);
+    prefs.remove("admin_user");
+    prefs.remove("admin_pass");
+    prefs.end();
+    Serial.println(F("Admin account cleared from NVS"));
 }

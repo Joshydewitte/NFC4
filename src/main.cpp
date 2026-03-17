@@ -112,6 +112,18 @@ void setup() {
     wifiManager.loop();
     delay(10);
   }
+
+  // Teardown captive portal AP/DNS now that the loop has exited.
+  wifiManager.stopConfigMode();
+
+  // If WiFi was just configured via the captive portal, restart so the main
+  // web server can bind port 80 cleanly (server.end() does not free the socket
+  // fast enough for a same-boot handover — bind error -8 otherwise).
+  if (wifiManager.isRestartPending()) {
+    Serial.println(F("\n✅ WiFi geconfigureerd — herstart om webserver te starten..."));
+    delay(600);   // let stopConfigMode() fully flush TCP before restart
+    ESP.restart();
+  }
   
   // Setup network services
   if (wifiManager.isConnected()) {
@@ -1430,6 +1442,23 @@ void handleSerialCommands() {
   
   // Ignore empty commands
   if (command.length() == 0) {
+    return;
+  }
+
+  // Reset admin account (clears NVS so setup page appears again)
+  if (command == "resetadmin") {
+    systemConfig.resetAdminAccount();
+    Serial.println(F("✅ Admin account reset. Open the web interface to create a new account."));
+    return;
+  }
+
+  // Full factory reset — clears all settings (WiFi, admin, server URL, etc.) then reboots
+  if (command == "factoryreset") {
+    Serial.println(F("⚠️  FACTORY RESET — alle instellingen worden gewist..."));
+    systemConfig.factoryReset();
+    Serial.println(F("✅ Klaar. Herstart over 2 seconden..."));
+    delay(2000);
+    ESP.restart();
     return;
   }
   

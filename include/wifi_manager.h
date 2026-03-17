@@ -20,6 +20,8 @@ private:
     const byte DNS_PORT = 53;
     
     bool configMode = false;
+    bool _apStarted = false;   // true when softAP is actually running
+    bool _restartAfterWifi = false;  // restart instead of switching port-80 servers
     String connectedSSID = "";
     IPAddress stationIP;
 
@@ -67,6 +69,7 @@ public:
     void startConfigMode() {
         Serial.println(F("\n📡 Start Configuratie Modus"));
         configMode = true;
+        _apStarted = true;
         
         // Start Access Point
         WiFi.mode(WIFI_AP_STA);
@@ -144,51 +147,45 @@ public:
     }
     
     void handleScan(AsyncWebServerRequest* request) {
-        Serial.println(F("WiFi scan gestart..."));
-        int n = WiFi.scanNetworks();
-        
-        String json = "{\"networks\":[";
-        
+        int16_t n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_FAILED || n == 0) {
+            // No scan running and no stale results — kick off an async scan
+            WiFi.scanNetworks(true /*async*/, true /*show_hidden*/);
+            // Return "scanning" so the client knows to poll again
+            request->send(200, "application/json", "{\"scanning\":true,\"networks\":[]}");
+            return;
+        }
+        if (n == WIFI_SCAN_RUNNING) {
+            // Still busy — tell the client to keep polling
+            request->send(200, "application/json", "{\"scanning\":true,\"networks\":[]}");
+            return;
+        }
+        // n >= 1: scan results are ready
+        Serial.printf("[WiFi] Scan klaar: %d netwerken\n", n);
+        String json = "{\"scanning\":false,\"networks\":[";
         for (int i = 0; i < n; i++) {
             if (i > 0) json += ",";
             json += "{";
             json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
             json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
             json += "\"encryption\":\"";
-            
             switch (WiFi.encryptionType(i)) {
-                case WIFI_AUTH_OPEN:
-                    json += "Open";
-                    break;
-                case WIFI_AUTH_WEP:
-                    json += "WEP";
-                    break;
-                case WIFI_AUTH_WPA_PSK:
-                    json += "WPA";
-                    break;
-                case WIFI_AUTH_WPA2_PSK:
-                    json += "WPA2";
-                    break;
-                case WIFI_AUTH_WPA_WPA2_PSK:
-                    json += "WPA/WPA2";
-                    break;
-                case WIFI_AUTH_WPA2_ENTERPRISE:
-                    json += "WPA2-Enterprise";
-                    break;
-                default:
-                    json += "Unknown";
+                case WIFI_AUTH_OPEN:            json += "Open"; break;
+                case WIFI_AUTH_WEP:             json += "WEP"; break;
+                case WIFI_AUTH_WPA_PSK:         json += "WPA"; break;
+                case WIFI_AUTH_WPA2_PSK:        json += "WPA2"; break;
+                case WIFI_AUTH_WPA_WPA2_PSK:    json += "WPA/WPA2"; break;
+                case WIFI_AUTH_WPA2_ENTERPRISE: json += "WPA2-Enterprise"; break;
+                default:                        json += "Unknown"; break;
             }
             json += "\"";
             json += "}";
         }
-        
         json += "]}";
-        
+        WiFi.scanDelete();  // free scan memory
         Serial.print(F("Gevonden netwerken: "));
         Serial.println(n);
-        
         request->send(200, "application/json", json);
-        WiFi.scanDelete();
     }
     
     void handleConnect(AsyncWebServerRequest* request) {
@@ -223,22 +220,25 @@ public:
             successPage.replace("%IP_ADDRESS%", stationIP.toString());
             successPage.replace("%SSID%", connectedSSID);
             request->send(200, "text/html", successPage);
-            
-            // Stop configuratie modus (server blijft actief maar AP wordt afgebroken)
-            stopConfigMode();
-            
-            // Roep callback aan
-            if (onConnectedCallback != nullptr) {
-                onConnectedCallback();
-            }
+
+            // Signal main.cpp to restart after this response is sent.
+            // Restarting is the only reliable way to free port 80 from the
+            // config-portal AsyncWebServer so the main web server can bind it.
+            _restartAfterWifi = true;
+            configMode = false;  // exit the while-loop in main.cpp
         } else {
             // Nog aan het verbinden
             request->send(200, "text/html", "<html><body><h1>Nog aan het verbinden...</h1><script>setTimeout(function(){window.location.href='/status';}, 2000);</script></body></html>");
         }
     }
     
-    bool connectToWiFi(String ssid, String password) {
-        WiFi.mode(WIFI_STA);
+    bool connectToWiFi(String ssid, String password, bool keepAP = false) {
+        // keepAP=true: already in WIFI_AP_STA mode from startConfigMode(),
+        // so we must NOT call WiFi.mode(WIFI_STA) or the AP shuts down
+        // while the phone is still connected to it (breaks status polling).
+        if (!keepAP) {
+            WiFi.mode(WIFI_STA);
+        }
         WiFi.begin(ssid.c_str(), password.c_str());
         
         Serial.print(F("Verbinden"));
@@ -254,13 +254,14 @@ public:
     }
     
     void stopConfigMode() {
-        if (configMode) {
+        if (_apStarted) {
             Serial.println(F("Stop configuratie modus"));
             dnsServer.stop();
-            // AsyncWebServer has no stop() — AP teardown makes it unreachable
+            server.end();  // Stop config portal — frees port 80 for the main web server
             WiFi.softAPdisconnect(true);
-            configMode = false;
+            _apStarted = false;
         }
+        configMode = false;
     }
     
     void loop() {
@@ -269,7 +270,7 @@ public:
             // Execute pending WiFi connection from main loop (avoids blocking async task)
             if (pendingConnect) {
                 pendingConnect = false;
-                if (connectToWiFi(pendingSSID, pendingPassword)) {
+                if (connectToWiFi(pendingSSID, pendingPassword, true /*keepAP*/)) {
                     connectedSSID = pendingSSID;
                     stationIP = WiFi.localIP();
                     Serial.println(F("✅ Verbinding succesvol!"));
@@ -284,6 +285,10 @@ public:
     
     bool isConfigMode() {
         return configMode;
+    }
+
+    bool isRestartPending() {
+        return _restartAfterWifi;
     }
     
     bool isConnected() {

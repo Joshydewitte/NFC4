@@ -82,6 +82,18 @@ const char SUCCESS_PAGE[] PROGMEM = R"rawliteral(
             font-size: 18px;
             margin-top: 15px;
         }
+        .open-btn {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 14px 32px;
+            background: #11998e;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .open-btn:hover { background: #0d7065; }
     </style>
 </head>
 <body>
@@ -104,8 +116,16 @@ const char SUCCESS_PAGE[] PROGMEM = R"rawliteral(
         </div>
         
         <div class="note">
-            ℹ️ Dit venster sluit over <span class="countdown" id="countdown">10</span> seconden.<br>
-            Je ESP32 is nu klaar voor gebruik op het nieuwe netwerk.
+            ℹ️ Verbindt je apparaat met je thuisnetwerk en ga dan naar:<br>
+            <strong><a href="http://%IP_ADDRESS%/" target="_blank" style="color:#11998e;">http://%IP_ADDRESS%/</a></strong>
+        </div>
+
+        <a class="open-btn" href="http://%IP_ADDRESS%/" target="_blank">
+            Open ESP32 →
+        </a>
+
+        <div class="countdown">
+            Automatisch omleiden over <span id="countdown">10</span>s...
         </div>
     </div>
 
@@ -118,6 +138,14 @@ const char SUCCESS_PAGE[] PROGMEM = R"rawliteral(
             countdownElement.textContent = seconds;
             
             if (seconds <= 0) {
+                clearInterval(interval);
+                // Redirect to the ESP32's new IP on the home network.
+                // The phone may still be on the ESP32 AP at this point; the
+                // redirect will succeed once it reconnects to home WiFi.
+                window.location.href = 'http://%IP_ADDRESS%/';
+            }
+        }, 1000);
+    </script>
                 clearInterval(interval);
                 window.close();
             }

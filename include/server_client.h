@@ -17,7 +17,17 @@ private:
     NFCWebServer* webServer = nullptr;
     String readerId  = "";   // SHA-256 derived from MAC, set at startup
     String readerToken = ""; // API token from server after registration
-    
+
+    // ─── Server Discovery ────────────────────────────────────────────────────
+    volatile bool _discoveryRunning = false;
+    struct _DiscCtx { ServerClient* self; };
+    static void _discoveryTask(void* pv) {
+        _DiscCtx* ctx = static_cast<_DiscCtx*>(pv);
+        ctx->self->_runDiscovery();
+        delete ctx;
+        vTaskDelete(nullptr);
+    }
+
 public:
     ServerClient() {}
     
@@ -158,7 +168,88 @@ public:
         hc.end();
         return code;
     }
+    // ─── Server Discovery ────────────────────────────────────────────────────
 
+    bool isDiscoveryRunning() const { return _discoveryRunning; }
+
+    /**
+     * Scan the local /24 subnet for NFC servers on port 3000.
+     * Probes gateway + hosts .1-.20 + local-IP ±5 (up to 40 candidates, 350 ms timeout each).
+     * Runs on a background FreeRTOS task; results are pushed to all WebSocket clients:
+     *   {type:"discovery_start", data:{total:N}}
+     *   {type:"discovery_found", data:{url:"http://..."}}
+     *   {type:"discovery_done",  data:{count:N}}
+     * Returns immediately.
+     */
+    void startServerDiscovery() {
+        if (_discoveryRunning) return;
+        _discoveryRunning = true;
+        _DiscCtx* ctx = new _DiscCtx{this};
+        if (xTaskCreate(_discoveryTask, "nfc_disc", 12288, ctx, 1, nullptr) != pdPASS) {
+            delete ctx;
+            _discoveryRunning = false;
+            Serial.println(F("[DISC] \u274c Kon discovery task niet starten"));
+        }
+    }
+
+    void _runDiscovery() {
+        // Wait for the WebSocket handshake (opened by the browser just before
+        // POSTing /api/discover-server) to fully register on the ESP side.
+        // Without this delay the first broadcast messages are sent before the
+        // WS client is connected and are silently dropped.
+        vTaskDelay(800 / portTICK_PERIOD_MS);
+
+        IPAddress localIP = WiFi.localIP();
+        IPAddress gw      = WiFi.gatewayIP();
+
+        const int MAX_CANDS = 40;
+        IPAddress cands[MAX_CANDS];
+        int cnt = 0;
+        auto push = [&](IPAddress ip) {
+            if (ip == localIP) return;
+            for (int j = 0; j < cnt; j++) if (cands[j] == ip) return;
+            if (cnt < MAX_CANDS) cands[cnt++] = ip;
+        };
+        push(gw);
+        for (int h = 1; h <= 20; h++)
+            push(IPAddress(localIP[0], localIP[1], localIP[2], (uint8_t)h));
+        for (int d = -5; d <= 5; d++) {
+            int h = (int)localIP[3] + d;
+            if (h >= 1 && h <= 254)
+                push(IPAddress(localIP[0], localIP[1], localIP[2], (uint8_t)h));
+        }
+
+        Serial.printf("[DISC] Zoeken op %d adressen (poort 3000)...\n", cnt);
+        extern void webServerBroadcastRaw(NFCWebServer* ws, const String& json);
+        if (webServer)
+            webServerBroadcastRaw(webServer,
+                "{\"type\":\"discovery_start\",\"data\":{\"total\":" + String(cnt) + "}}");
+
+        int found = 0;
+        for (int i = 0; i < cnt; i++) {
+            String url = "http://" + cands[i].toString() + ":3000";
+            HTTPClient hc;
+            hc.begin(url + "/api/ping");
+            hc.setTimeout(350);
+            hc.addHeader("User-Agent", "ESP32-NFC-Discovery/1.0");
+            int code = hc.GET();
+            if (code == 200) {
+                found++;
+                Serial.print(F("[DISC] Gevonden: ")); Serial.println(url);
+                if (webServer)
+                    webServerBroadcastRaw(webServer,
+                        "{\"type\":\"discovery_found\",\"data\":{\"url\":\"" + url + "\"}}");
+            }
+            hc.end();
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+        }
+
+        Serial.printf("[DISC] Klaar. %d server(s) gevonden.\n", found);
+        if (webServer)
+            webServerBroadcastRaw(webServer,
+                "{\"type\":\"discovery_done\",\"data\":{\"count\":" + String(found) + "}}");
+        _discoveryRunning = false;
+    }
     /**
      * Call from loop().  Only fires when PING_INTERVAL has elapsed.
      * Pass requestChallenge=true when the cached nonce is stale/absent so

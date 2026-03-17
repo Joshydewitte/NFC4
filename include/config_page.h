@@ -197,41 +197,46 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         function scanNetworks() {
             document.getElementById('spinner').style.display = 'block';
             document.getElementById('networks').innerHTML = '';
-            
-            fetch('/scan')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('spinner').style.display = 'none';
-                    const networksDiv = document.getElementById('networks');
-                    networksDiv.innerHTML = '<div class="network-list">';
-                    
-                    if (data.networks && data.networks.length > 0) {
-                        data.networks.forEach(network => {
-                            const signalStrength = network.rssi > -50 ? 'Excellent' : 
-                                                 network.rssi > -60 ? 'Goed' : 
-                                                 network.rssi > -70 ? 'Redelijk' : 'Zwak';
-                            const secure = network.encryption !== 'Open' ? '🔒 Beveiligd' : '🔓 Open';
-                            
-                            networksDiv.innerHTML += `
-                                <div class="network-item" onclick="selectNetwork('${network.ssid}', ${network.encryption !== 'Open'})">
-                                    <div>
-                                        <div class="network-name">${network.ssid}</div>
-                                        <div class="network-signal">Signaal: ${signalStrength} (${network.rssi} dBm)</div>
+
+            function poll() {
+                fetch('/scan')
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.scanning) {
+                            // Still scanning — poll again in 1 second
+                            setTimeout(poll, 1000);
+                            return;
+                        }
+                        document.getElementById('spinner').style.display = 'none';
+                        const networksDiv = document.getElementById('networks');
+                        networksDiv.innerHTML = '<div class="network-list">';
+                        if (data.networks && data.networks.length > 0) {
+                            data.networks.forEach(network => {
+                                const signalStrength = network.rssi > -50 ? 'Excellent' :
+                                                     network.rssi > -60 ? 'Goed' :
+                                                     network.rssi > -70 ? 'Redelijk' : 'Zwak';
+                                const secure = network.encryption !== 'Open' ? '🔒 Beveiligd' : '🔓 Open';
+                                networksDiv.innerHTML += `
+                                    <div class="network-item" onclick="selectNetwork('${network.ssid}', ${network.encryption !== 'Open'})">
+                                        <div>
+                                            <div class="network-name">${network.ssid}</div>
+                                            <div class="network-signal">Signaal: ${signalStrength} (${network.rssi} dBm)</div>
+                                        </div>
+                                        <div class="network-secure">${secure}</div>
                                     </div>
-                                    <div class="network-secure">${secure}</div>
-                                </div>
-                            `;
-                        });
-                    } else {
-                        networksDiv.innerHTML += '<p style="text-align:center;color:#999;">Geen netwerken gevonden</p>';
-                    }
-                    
-                    networksDiv.innerHTML += '</div>';
-                })
-                .catch(error => {
-                    document.getElementById('spinner').style.display = 'none';
-                    alert('Fout bij scannen: ' + error);
-                });
+                                `;
+                            });
+                        } else {
+                            networksDiv.innerHTML += '<p style="text-align:center;color:#999;">Geen netwerken gevonden</p>';
+                        }
+                        networksDiv.innerHTML += '</div>';
+                    })
+                    .catch(error => {
+                        document.getElementById('spinner').style.display = 'none';
+                        alert('Fout bij scannen: ' + error);
+                    });
+            }
+            poll();
         }
         
         function selectNetwork(ssid, isSecure) {

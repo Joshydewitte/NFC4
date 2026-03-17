@@ -193,8 +193,19 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
                 <span id="serverStatus">%SERVER_STATUS%</span>
             </div>
         </div>
-        <button onclick="saveServerSettings()">💾 Server Opslaan</button>
-        <button onclick="testServer()" style="margin-left: 10px;">🔄 Test Verbinding</button>
+        <div class="button-group" style="margin-top:15px;">
+            <button onclick="saveServerSettings()">💾 Server Opslaan</button>
+            <button onclick="testServer()">🔄 Test Verbinding</button>
+            <button onclick="discoverServer()" id="discoverBtn"
+                style="background:linear-gradient(135deg,#11998e 0%,#38ef7d 100%);">🔍 Zoek Server</button>
+        </div>
+
+        <div id="discoveryPanel" style="display:none;margin-top:15px;">
+            <div style="background:#f0f4ff;border-left:4px solid #667eea;padding:12px;border-radius:5px;">
+                <div id="discoveryStatus" style="font-size:13px;color:#555;margin-bottom:8px;"></div>
+                <div id="discoveryResults"></div>
+            </div>
+        </div>
     </div>
 
     <div class="card">
@@ -502,13 +513,20 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
         }
         
         function factoryReset() {
-            if (confirm('WAARSCHUWING: Alle instellingen worden gewist! Doorgaan?')) {
+            if (confirm('WAARSCHUWING: Alle instellingen worden gewist!\n\nNa de reset verbind je opnieuw met het WiFi netwerk "ESP32-NFC-Config" om de reader opnieuw in te stellen.\n\nDoorgaan?')) {
                 fetch('/api/factory-reset', { 
                     method: 'POST',
                     credentials: 'same-origin'
+                }).then(r => r.json()).then(data => {
+                    if (data.success) {
+                        showMessage('✅ Factory reset gelukt! Verbind nu met WiFi netwerk "ESP32-NFC-Config" om opnieuw in te stellen.');
+                    } else {
+                        showMessage('❌ Reset mislukt: ' + (data.message || 'onbekende fout'));
+                    }
+                }).catch(() => {
+                    // ESP already rebooted — fetch will throw a network error, that is expected
+                    showMessage('✅ Factory reset gelukt! Verbind nu met WiFi netwerk "ESP32-NFC-Config" om opnieuw in te stellen.');
                 });
-                showMessage('⚠️ Factory reset uitgevoerd...');
-                setTimeout(() => location.href = '/', 3000);
             }
         }
         
@@ -588,6 +606,84 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
             .then(r => r.json())
             .then(data => showMessage(data.success ? '✅ NDEF instellingen opgeslagen' : '❌ Opslaan mislukt', !data.success))
             .catch(e => showMessage('❌ Fout: ' + e, true));
+        }
+
+        // ============ SERVER DISCOVERY ============
+        let _discWs = null;
+        let _discActive = false;
+
+        function discoverServer() {
+            if (_discActive) return;
+            _discActive = true;
+            document.getElementById('discoverBtn').disabled = true;
+            const panel = document.getElementById('discoveryPanel');
+            panel.style.display = 'block';
+            document.getElementById('discoveryResults').innerHTML = '';
+            document.getElementById('discoveryStatus').textContent = '&#x1F50C; Verbinding opzetten...';
+
+            const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            _discWs = new WebSocket(wsProto + '//' + location.hostname + '/ws');
+
+            _discWs.onopen = function() {
+                fetch('/api/discover-server', { method: 'POST', credentials: 'same-origin' })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (!d.success) {
+                        document.getElementById('discoveryStatus').textContent = '&#x274C; ' + (d.message || 'Mislukt');
+                        _discActive = false;
+                        document.getElementById('discoverBtn').disabled = false;
+                    }
+                })
+                .catch(function(e) {
+                    document.getElementById('discoveryStatus').textContent = '&#x274C; ' + e;
+                    _discActive = false;
+                    document.getElementById('discoverBtn').disabled = false;
+                });
+            };
+
+            _discWs.onmessage = function(evt) {
+                try {
+                    const msg = JSON.parse(evt.data);
+                    if (msg.type === 'discovery_start') {
+                        document.getElementById('discoveryStatus').textContent =
+                            '&#x1F50D; Zoeken... (' + (msg.data.total || '?') + ' adressen op poort 3000)';
+                    } else if (msg.type === 'discovery_found') {
+                        const url = msg.data.url;
+                        const el  = document.createElement('div');
+                        el.style.cssText = 'display:flex;align-items:center;justify-content:space-between;' +
+                            'padding:8px;background:white;border-radius:4px;margin-bottom:6px;border:1px solid #e0e0e0;';
+                        const span = document.createElement('span');
+                        span.style.cssText = 'font-family:monospace;font-size:13px;';
+                        span.textContent = '\u2705 ' + url;
+                        const btn = document.createElement('button');
+                        btn.textContent = 'Gebruik';
+                        btn.style.cssText = 'padding:5px 14px;font-size:12px;margin:0;';
+                        btn.addEventListener('click', function() { useServer(url); });
+                        el.appendChild(span);
+                        el.appendChild(btn);
+                        document.getElementById('discoveryResults').appendChild(el);
+                    } else if (msg.type === 'discovery_done') {
+                        const cnt = msg.data.count;
+                        document.getElementById('discoveryStatus').textContent = cnt > 0
+                            ? '&#x2705; Klaar \u2014 ' + cnt + ' server(s) gevonden'
+                            : '&#x26A0;&#xFE0F; Geen server gevonden \u2014 vul het adres handmatig in';
+                        _discActive = false;
+                        document.getElementById('discoverBtn').disabled = false;
+                        if (_discWs) { _discWs.close(); _discWs = null; }
+                    }
+                } catch(e) {}
+            };
+
+            _discWs.onerror = function() {
+                document.getElementById('discoveryStatus').textContent = '&#x274C; WebSocket verbindingsfout';
+                _discActive = false;
+                document.getElementById('discoverBtn').disabled = false;
+            };
+        }
+
+        function useServer(url) {
+            document.getElementById('serverUrl').value = url;
+            showMessage('\u2705 Server URL ingevuld \u2014 klik op "&#x1F4BE; Server Opslaan" om te bevestigen');
         }
 
         // Load settings on page load

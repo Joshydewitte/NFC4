@@ -192,9 +192,9 @@ const char ADMIN_SETUP_PAGE[] PROGMEM = R"rawliteral(
             
             fetch('/setup-admin', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                headers: { 'Content-Type': 'application/json' },
                 credentials: 'same-origin',
-                body: 'username=' + encodeURIComponent(username) + '&password=' + encodeURIComponent(password)
+                body: JSON.stringify({ username: username, password: password })
             })
             .then(response => response.json())
             .then(data => {

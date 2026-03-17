@@ -114,6 +114,7 @@ public:
       // ============ RESET FUNCTIONS ============
     void resetNetwork();
     void factoryReset();
+    void resetAdminAccount();
 };
 
 #endif // SYSTEM_CONFIG_H
