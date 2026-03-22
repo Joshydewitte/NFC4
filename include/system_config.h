@@ -110,6 +110,8 @@ public:
       void setReaderToken(const String& token);
       String getReaderToken();
       bool hasReaderToken();
+      void setServerMac(const String& mac);
+      String getServerMac();
 
       // ============ RESET FUNCTIONS ============
     void resetNetwork();

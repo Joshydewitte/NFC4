@@ -246,6 +246,10 @@ private:
                     return;
                 }
                 config->setReaderToken(token);
+                if (doc["serverMac"].is<const char*>()) {
+                    String serverMac = doc["serverMac"].as<String>();
+                    if (serverMac.length() > 0) config->setServerMac(serverMac);
+                }
                 if (serverClient) {
                     serverClient->setReaderToken(token);
                 }

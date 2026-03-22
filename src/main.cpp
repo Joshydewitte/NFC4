@@ -81,6 +81,39 @@ unsigned long lastScannedAt = 0;
 
 // ============ APPLICATION LOGIC ============
 
+// Base62 alphabet: 0-9, a-z, A-Z (62 tekens)
+static const char BASE62_ALPHABET[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/**
+ * Compute a location-unique 8-char suffix for a card URL.
+ * HMAC-SHA256(key=serverMac, msg=cardUid) → eerste 5 bytes → base62(8 tekens)
+ */
+String computeHmacBase62Suffix(const String& serverMac, const String& cardUid) {
+  // UID van de NFC-reader is altijd lowercase hex (Arduino String(x, HEX)).
+  // Het algoritme verwacht uppercase (bijv. "04:39:20:02:E5:75:80").
+  String uidUpper = cardUid;
+  uidUpper.toUpperCase();
+
+  uint8_t hmacOut[32];
+  const mbedtls_md_info_t* mdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  mbedtls_md_hmac(mdInfo,
+    (const uint8_t*)serverMac.c_str(), serverMac.length(),
+    (const uint8_t*)uidUpper.c_str(),  uidUpper.length(),
+    hmacOut);
+
+  // First 5 bytes → 40-bit big-endian integer
+  uint64_t value = 0;
+  for (int i = 0; i < 5; i++) value = (value << 8) | hmacOut[i];
+
+  // Base62-encode to exactly 8 characters
+  char result[9] = {0};
+  for (int i = 7; i >= 0; i--) {
+    result[i] = BASE62_ALPHABET[value % 62];
+    value /= 62;
+  }
+  return String(result);
+}
+
 void handleMachineMode(NFCReader::CardInfo& cardInfo);
 void handleConfigMode(NFCReader::CardInfo& cardInfo);
 void handleWriteMode(NFCReader::CardInfo& cardInfo);
@@ -997,6 +1030,11 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
       String ndefId = NTAG424Crypto::deriveNdefId(masterSecret, uid, 10);
       resolvedUrl.replace("{id}", ndefId);
     }
+    if (resolvedUrl.indexOf("{suffix}") >= 0) {
+      String serverMac = systemConfig.getServerMac();
+      String suffix = serverMac.length() > 0 ? computeHmacBase62Suffix(serverMac, uid) : "";
+      resolvedUrl.replace("{suffix}", suffix);
+    }
     Serial.print(F("    NDEF URL: "));
     Serial.println(resolvedUrl);
     webServer.broadcastWriteCardStatus(uid, "processing", "Schrijf URL: " + resolvedUrl);
@@ -1373,6 +1411,11 @@ void handleWriteMode(NFCReader::CardInfo& cardInfo) {
         String masterSecret = systemConfig.getMasterSecret();
         String ndefId = NTAG424Crypto::deriveNdefId(masterSecret, uid, 10);
         resolvedUrl.replace("{id}", ndefId);
+      }
+      if (resolvedUrl.indexOf("{suffix}") >= 0) {
+        String serverMac = systemConfig.getServerMac();
+        String suffix = serverMac.length() > 0 ? computeHmacBase62Suffix(serverMac, uid) : "";
+        resolvedUrl.replace("{suffix}", suffix);
       }
       Serial.print(F("    URL: "));
       Serial.println(resolvedUrl);

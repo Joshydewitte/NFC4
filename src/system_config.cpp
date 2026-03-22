@@ -31,6 +31,7 @@ void SystemConfig::begin() {
     if (!prefs.isKey("ndef_mode"))    prefs.putString("ndef_mode",    "keys_only");
     if (!prefs.isKey("reader_id"))    prefs.putString("reader_id",    "");
     if (!prefs.isKey("reader_token")) prefs.putString("reader_token", "");
+    if (!prefs.isKey("server_mac"))   prefs.putString("server_mac",   "");
     if (!prefs.isKey("admin_user"))   prefs.putString("admin_user",   "");
     if (!prefs.isKey("admin_pass"))   prefs.putString("admin_pass",   "");
     prefs.end();
@@ -474,6 +475,21 @@ String SystemConfig::getReaderToken() {
 
 bool SystemConfig::hasReaderToken() {
     return getReaderToken().length() > 0;
+}
+
+void SystemConfig::setServerMac(const String& mac) {
+    prefs.begin("system", false);
+    prefs.putString("server_mac", mac);
+    prefs.end();
+    Serial.print(F("Server MAC saved: "));
+    Serial.println(mac);
+}
+
+String SystemConfig::getServerMac() {
+    prefs.begin("system", true);
+    String mac = prefs.getString("server_mac", "");
+    prefs.end();
+    return mac;
 }
 
 // ============ RESET FUNCTIONS ============

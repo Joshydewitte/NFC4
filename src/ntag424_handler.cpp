@@ -1151,32 +1151,52 @@ bool NTAG424Handler::writeNDEF(const String& url) {
 
     // Build WriteData native command (without CLA/P1/P2 - sendCommand adds those):
     //   [INS=0x8D] [FileNo] [Offset(3 LE)] [Length(3 LE)] [FileData]
-    uint8_t cmd[1 + 7 + 256];
-    cmd[0] = 0x8D;                      // INS: WriteData
-    cmd[1] = 0x02;                      // FileNo = 02 (NDEF file)
-    cmd[2] = 0x00;                      // Offset byte 0 (LE)
-    cmd[3] = 0x00;                      // Offset byte 1
-    cmd[4] = 0x00;                      // Offset byte 2
-    cmd[5] = (uint8_t)(filePos & 0xFF);         // Length byte 0 (LE)
-    cmd[6] = (uint8_t)((filePos >> 8) & 0xFF);  // Length byte 1
-    cmd[7] = 0x00;                      // Length byte 2
-    memcpy(cmd + 8, fileBuf, filePos);
-    size_t cmdLen = 8 + filePos;        // INS(1) + params(7) + data
+    //
+    // NTAG424 DNA FSC = 64 bytes (ATS T0=0x75, FSCI=5).
+    // Max APDU per I-block = 63 bytes.
+    // WriteData APDU overhead: CLA(1)+INS(1)+P1(1)+P2(1)+Lc(1)+Le(1) = 6
+    //   plus native params: FileNo(1)+Offset(3)+Length(3) = 7  →  total 13 bytes overhead.
+    // Max file data per chunk = 63 - 13 = 50 bytes.
+    // Split into multiple WriteData commands if filePos > 50.
+    const size_t MAX_CHUNK = 50;
 
     char dbgBuf[72];
-    sprintf(dbgBuf, ">> WriteData File02 (NDEF), fileLen=%u NLEN=%u", (unsigned)filePos, (unsigned)nlen);
+    sprintf(dbgBuf, ">> WriteData File02 (NDEF), fileLen=%u NLEN=%u chunks=%u",
+            (unsigned)filePos, (unsigned)nlen,
+            (unsigned)((filePos + MAX_CHUNK - 1) / MAX_CHUNK));
     logDebug(dbgBuf);
     logToWeb("Schrijf NDEF URL naar kaart...", "info");
 
-    uint8_t response[16];
-    size_t responseLen = sizeof(response);
-    if (!sendCommand(cmd, cmdLen, response, responseLen)) {
-        logToWeb("NDEF URL schrijven mislukt", "error");
-        return false;
+    size_t written = 0;
+    while (written < filePos) {
+        size_t chunkSize = filePos - written;
+        if (chunkSize > MAX_CHUNK) chunkSize = MAX_CHUNK;
+
+        uint8_t cmd[8 + MAX_CHUNK];
+        cmd[0] = 0x8D;                                      // INS: WriteData
+        cmd[1] = 0x02;                                      // FileNo = 02 (NDEF file)
+        cmd[2] = (uint8_t)(written & 0xFF);                 // Offset LE byte 0
+        cmd[3] = (uint8_t)((written >> 8) & 0xFF);          // Offset LE byte 1
+        cmd[4] = 0x00;                                      // Offset LE byte 2
+        cmd[5] = (uint8_t)(chunkSize & 0xFF);               // Length LE byte 0
+        cmd[6] = (uint8_t)((chunkSize >> 8) & 0xFF);        // Length LE byte 1
+        cmd[7] = 0x00;                                      // Length LE byte 2
+        memcpy(cmd + 8, fileBuf + written, chunkSize);
+        size_t cmdLen = 8 + chunkSize;
+
+        logDebug("  chunk offset=" + String(written) + " len=" + String(chunkSize));
+
+        uint8_t response[16];
+        size_t responseLen = sizeof(response);
+        if (!sendCommand(cmd, cmdLen, response, responseLen)) {
+            logToWeb("NDEF URL schrijven mislukt", "error");
+            return false;
+        }
+        // WriteData increments the card's CommandCounter (AN12196 §6.10.1).
+        commandCounter++;
+        written += chunkSize;
     }
-    // WriteData increments the card's CommandCounter (AN12196 §6.10.1).
-    // Keep the host counter in sync so the next EV2-MAC'd command (SetupSDM) is correct.
-    commandCounter++;
+
     logDebug("<< NDEF write OK (SW=9100)");
     logToWeb("NDEF URL geschreven", "success");
     return true;
