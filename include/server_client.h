@@ -153,6 +153,29 @@ public:
     }
 
     /**
+     * Fetch the server's MAC address from /api/ping.
+     * Returns the MAC string (e.g. "0C:9D:92:87:CB:6A") or "" on failure.
+     * Uses a local HTTPClient to avoid conflicts with the member http instance.
+     */
+    String fetchServerMac() {
+        if (serverUrl.isEmpty()) return "";
+        HTTPClient localHttp;
+        localHttp.begin(serverUrl + "/api/ping");
+        localHttp.setTimeout(3000);
+        String mac = "";
+        int code = localHttp.GET();
+        if (code == 200) {
+            String body = localHttp.getString();
+            StaticJsonDocument<256> doc;
+            if (!deserializeJson(doc, body) && doc["serverMac"].is<const char*>()) {
+                mac = doc["serverMac"].as<String>();
+            }
+        }
+        localHttp.end();
+        return mac;
+    }
+
+    /**
      * Quick check whether the server still recognises this reader's token.
      * Sends GET /api/challenge/initial with reader-auth headers.
      * Returns the raw HTTP status code: 200=registered, 401=removed/unknown, <0=unreachable.

@@ -246,12 +246,15 @@ private:
                     return;
                 }
                 config->setReaderToken(token);
-                if (doc["serverMac"].is<const char*>()) {
-                    String serverMac = doc["serverMac"].as<String>();
-                    if (serverMac.length() > 0) config->setServerMac(serverMac);
-                }
                 if (serverClient) {
                     serverClient->setReaderToken(token);
+                    String serverMac = serverClient->fetchServerMac();
+                    if (serverMac.length() > 0) {
+                        config->setServerMac(serverMac);
+                        Serial.println("✅ Server MAC auto-opgeslagen: " + serverMac);
+                    } else {
+                        Serial.println(F("⚠️  Server MAC kon niet automatisch worden opgehaald"));
+                    }
                 }
                 request->send(200, "application/json", "{\"success\":true}");
             },

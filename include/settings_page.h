@@ -224,10 +224,6 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
             <label for="readerApiToken">API Token (van de server na registratie)</label>
             <input type="text" id="readerApiToken" placeholder="Na registratie op server invullen" maxlength="64">
         </div>
-        <div class="form-group">
-            <label for="serverMacInput">Server MAC (voor URL suffix — te vinden naast het token op de server)</label>
-            <input type="text" id="serverMacInput" placeholder="Bijv. 0C:9D:92:87:CB:6A" maxlength="17">
-        </div>
         <div id="readerTokenStatus" style="margin-bottom: 10px;">%READER_TOKEN_STATUS%</div>
         <button onclick="saveReaderToken()">💾 Token Opslaan</button>
     </div>
@@ -570,22 +566,18 @@ const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
                 showMessage('❌ Voer een API token in', true);
                 return;
             }
-            const payload = { token };
-            const serverMac = document.getElementById('serverMacInput').value.trim();
-            if (serverMac) payload.serverMac = serverMac;
             fetch('/api/settings/reader-token', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'same-origin',
-                body: JSON.stringify(payload)
+                body: JSON.stringify({ token })
             })
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    showMessage('✅ Reader token opgeslagen — herstart aanbevolen');
+                    showMessage('✅ Reader token opgeslagen — Server MAC automatisch opgehaald');
                     loadReaderInfo();
                     document.getElementById('readerApiToken').value = '';
-                    document.getElementById('serverMacInput').value = '';
                 } else {
                     showMessage('❌ Opslaan mislukt', true);
                 }
